@@ -92,6 +92,25 @@ function sessionInfoUiEquals(left: SessionInfo, right: SessionInfo): boolean {
   );
 }
 
+function coerceHistoryTimestamp(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractHistoryUserTimestamp(message: Record<string, unknown>): number | null {
+  return (
+    coerceHistoryTimestamp(message.timestamp) ??
+    coerceHistoryTimestamp(message.createdAt) ??
+    coerceHistoryTimestamp(message.updatedAt)
+  );
+}
+
 export function createSessionActions(context: SessionActionContext) {
   const {
     client,
@@ -448,7 +467,9 @@ export function createSessionActions(context: SessionActionContext) {
         await refreshSessionInfo();
       }
       const showTools = (state.sessionInfo.verboseLevel ?? "off") !== "off";
-      chatLog.clearAll();
+      const preservePendingUsers = chatLog.countPendingUsers() > 0;
+      const historyUsers: Array<{ text: string; timestamp?: number | null }> = [];
+      chatLog.clearAll({ preservePendingUsers });
       btw.clear();
       chatLog.addSystem(`session ${state.currentSessionKey}`);
       for (const entry of record.messages ?? []) {
@@ -467,6 +488,10 @@ export function createSessionActions(context: SessionActionContext) {
           const text = extractTextFromMessage(message);
           if (text) {
             chatLog.addUser(text);
+            historyUsers.push({
+              text,
+              timestamp: extractHistoryUserTimestamp(message),
+            });
           }
           continue;
         }
@@ -499,6 +524,13 @@ export function createSessionActions(context: SessionActionContext) {
             { isError: Boolean(message.isError) },
           );
         }
+      }
+      if (preservePendingUsers) {
+        const reconciledRunIds = chatLog.reconcilePendingUsers(historyUsers);
+        if (state.pendingSubmitDraft && reconciledRunIds.includes(state.pendingSubmitDraft.runId)) {
+          state.pendingSubmitDraft = null;
+        }
+        chatLog.restorePendingUsers();
       }
       // Restore a run still streaming for this session+agent that the gateway
       // reports as in-flight. Its live deltas were delivered to a per-agent key
@@ -533,6 +565,8 @@ export function createSessionActions(context: SessionActionContext) {
     state.activeChatRunId = null;
     state.pendingChatRunId = null;
     state.pendingOptimisticUserMessage = false;
+    state.pendingSubmitDraft = null;
+    chatLog.clearPendingUsers();
     setActivityStatus("idle");
     state.currentSessionId = null;
     // Session keys can move backwards in updatedAt ordering; drop previous session freshness
@@ -553,6 +587,8 @@ export function createSessionActions(context: SessionActionContext) {
     state.activeChatRunId = null;
     state.pendingChatRunId = null;
     state.pendingOptimisticUserMessage = false;
+    state.pendingSubmitDraft = null;
+    chatLog.clearPendingUsers();
     setActivityStatus("idle");
     state.currentSessionId = null;
     const defaults = lastSessionDefaults;
@@ -576,7 +612,7 @@ export function createSessionActions(context: SessionActionContext) {
     clearDisplayedSession();
   };
 
-  const abortActive = async (params?: { preferActive?: boolean }) => {
+  const abortActive = async (params?: { preferActive?: boolean }): Promise<TuiAbortActiveResult> => {
     if (
       opts.local === true &&
       state.activityStatus === "finishing context" &&
@@ -585,7 +621,7 @@ export function createSessionActions(context: SessionActionContext) {
     ) {
       chatLog.addSystem("agent is finishing context; wait for it to finish before aborting");
       tui.requestRender();
-      return;
+      return { aborted: false, runId: null };
     }
     const runIds =
       params?.preferActive && state.activeChatRunId && state.pendingChatRunId
@@ -598,11 +634,13 @@ export function createSessionActions(context: SessionActionContext) {
     if (runIds.length === 0) {
       chatLog.addSystem("no active run", { coalesceConsecutive: true });
       tui.requestRender();
-      return;
+      return { aborted: false, runId: null };
     }
     const abortsPendingRun = Boolean(
       state.pendingChatRunId && runIds.includes(state.pendingChatRunId),
     );
+    const pendingRunId = state.pendingChatRunId;
+    let restoredDraftText: string | undefined;
     try {
       for (const runId of runIds) {
         await client.abortChat({
@@ -614,13 +652,25 @@ export function createSessionActions(context: SessionActionContext) {
       state.pendingChatRunId = null;
       if (abortsPendingRun) {
         state.pendingOptimisticUserMessage = false;
+        if (pendingRunId && state.pendingSubmitDraft?.runId === pendingRunId) {
+          restoredDraftText = state.pendingSubmitDraft.text;
+          chatLog.dropPendingUser(pendingRunId);
+          state.pendingSubmitDraft = null;
+        }
       }
       setActivityStatus("aborted");
+      return {
+        aborted: true,
+        runId: pendingRunId ?? runIds[0] ?? null,
+        ...(restoredDraftText !== undefined ? { restoredDraftText } : {}),
+      };
     } catch (err) {
       chatLog.addSystem(`abort failed: ${String(err)}`);
       setActivityStatus("abort failed");
+      return { aborted: false, runId: pendingRunId ?? runIds[0] ?? null };
+    } finally {
+      tui.requestRender();
     }
-    tui.requestRender();
   };
 
   return {

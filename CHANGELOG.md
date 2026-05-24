@@ -45,6 +45,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- TUI: clear stale optimistic submit state after an Esc abort so the next prompt is not blocked as busy with no active run. (#86199)
 - Agents/TUI: keep local custom provider runs from loading plugin runtime and auth alias metadata when plugins are disabled.
 - Agents/TUI: restore in-flight TUI run switch-back behavior, keep no-policy native hook fallback available, guard vanished workspaces, and keep lightweight isolated subagents lightweight.
 - Agents/media: keep async image, music, and video generation starts from ending the Codex turn, so mixed requests can continue with summaries or other work while media renders in the background.

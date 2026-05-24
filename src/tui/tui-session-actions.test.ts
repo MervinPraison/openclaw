@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { ChatLog } from "./components/chat-log.js";
 import type { TuiBackend } from "./tui-backend.js";
 import { createSessionActions } from "./tui-session-actions.js";
 import { TUI_SESSION_LOOKUP_LIMIT } from "./tui-session-list-policy.js";
@@ -9,6 +10,22 @@ describe("tui session actions", () => {
     clear: vi.fn(),
     showResult: vi.fn(),
   });
+
+  const createChatLog = (overrides: Record<string, unknown> = {}) =>
+    ({
+      addSystem: vi.fn(),
+      addUser: vi.fn(),
+      clearAll: vi.fn(),
+      clearPendingUsers: vi.fn(),
+      countPendingUsers: vi.fn(() => 0),
+      reconcilePendingUsers: vi.fn(() => []),
+      restorePendingUsers: vi.fn(),
+      startTool: vi.fn(),
+      finalizeAssistant: vi.fn(),
+      updateAssistant: vi.fn(),
+      dropPendingUser: vi.fn(),
+      ...overrides,
+    }) as unknown as import("./components/chat-log.js").ChatLog;
 
   const createBaseState = (overrides: Partial<TuiStateAccess> = {}): TuiStateAccess => ({
     agentDefaultId: "main",
@@ -38,10 +55,7 @@ describe("tui session actions", () => {
   ) =>
     createSessionActions({
       client: { listSessions: vi.fn() } as unknown as TuiBackend,
-      chatLog: {
-        addSystem: vi.fn(),
-        clearAll: vi.fn(),
-      } as unknown as import("./components/chat-log.js").ChatLog,
+      chatLog: createChatLog(),
       btw: createBtwPresenter(),
       tui: { requestRender: vi.fn() } as unknown as import("@earendil-works/pi-tui").TUI,
       opts: {},
@@ -497,14 +511,7 @@ describe("tui session actions", () => {
     });
     const updateAssistant = vi.fn();
     const setActivityStatus = vi.fn();
-    const chatLog = {
-      addSystem: vi.fn(),
-      clearAll: vi.fn(),
-      addUser: vi.fn(),
-      finalizeAssistant: vi.fn(),
-      updateAssistant,
-      startTool: vi.fn(),
-    } as unknown as import("./components/chat-log.js").ChatLog;
+    const chatLog = createChatLog({ updateAssistant });
     const state = createBaseState({ currentSessionKey: "agent:main:other" });
 
     const { setSession } = createTestSessionActions({
@@ -529,14 +536,7 @@ describe("tui session actions", () => {
     });
     const updateAssistant = vi.fn();
     const setActivityStatus = vi.fn();
-    const chatLog = {
-      addSystem: vi.fn(),
-      clearAll: vi.fn(),
-      addUser: vi.fn(),
-      finalizeAssistant: vi.fn(),
-      updateAssistant,
-      startTool: vi.fn(),
-    } as unknown as import("./components/chat-log.js").ChatLog;
+    const chatLog = createChatLog({ updateAssistant });
     const state = createBaseState({ currentSessionKey: "agent:main:other" });
 
     const { setSession } = createTestSessionActions({
@@ -558,14 +558,7 @@ describe("tui session actions", () => {
     const loadHistory = vi.fn().mockResolvedValue({ sessionId: "session-x", messages: [] });
     const updateAssistant = vi.fn();
     const setActivityStatus = vi.fn();
-    const chatLog = {
-      addSystem: vi.fn(),
-      clearAll: vi.fn(),
-      addUser: vi.fn(),
-      finalizeAssistant: vi.fn(),
-      updateAssistant,
-      startTool: vi.fn(),
-    } as unknown as import("./components/chat-log.js").ChatLog;
+    const chatLog = createChatLog({ updateAssistant });
     const state = createBaseState({ currentSessionKey: "agent:main:other" });
 
     const { setSession } = createTestSessionActions({
@@ -737,10 +730,7 @@ describe("tui session actions", () => {
 
     const { setEmptySession } = createTestSessionActions({
       client: { listSessions, loadHistory } as unknown as TuiBackend,
-      chatLog: {
-        addSystem,
-        clearAll,
-      } as unknown as import("./components/chat-log.js").ChatLog,
+      chatLog: createChatLog({ addSystem, clearAll }),
       tui: { requestRender } as unknown as import("@earendil-works/pi-tui").TUI,
       state,
       rememberSessionKey,
@@ -857,10 +847,7 @@ describe("tui session actions", () => {
 
     const { abortActive } = createSessionActions({
       client: { listSessions: vi.fn(), abortChat } as unknown as TuiBackend,
-      chatLog: {
-        addSystem,
-        clearAll: vi.fn(),
-      } as unknown as import("./components/chat-log.js").ChatLog,
+      chatLog: createChatLog({ addSystem }),
       btw: createBtwPresenter(),
       tui: { requestRender: vi.fn() } as unknown as import("@earendil-works/pi-tui").TUI,
       opts: {},
@@ -875,15 +862,54 @@ describe("tui session actions", () => {
       setActivityStatus,
     });
 
-    await abortActive();
+    const result = await abortActive();
 
     expect(abortChat).toHaveBeenCalledWith({
       sessionKey: "agent:main:main",
       runId: "run-pending",
     });
     expect(addSystem).not.toHaveBeenCalledWith("no active run");
+    expect(result).toEqual({ aborted: true, runId: "run-pending" });
     expect(state.pendingChatRunId).toBeNull();
     expect(setActivityStatus).toHaveBeenCalledWith("aborted");
+  });
+
+  it("cleans up pending drafts after command aborts of a pending run", async () => {
+    const abortChat = vi.fn().mockResolvedValue({ ok: true, aborted: true });
+    const chatLog = new ChatLog(40);
+    chatLog.addPendingUser("run-pending", "restore me");
+    const state = createBaseState({
+      activeChatRunId: "run-active",
+      pendingChatRunId: "run-pending",
+      pendingOptimisticUserMessage: true,
+      pendingSubmitDraft: { runId: "run-pending", text: "restore me" },
+    });
+
+    const { abortActive } = createTestSessionActions({
+      client: { listSessions: vi.fn(), abortChat } as unknown as TuiBackend,
+      state,
+      chatLog,
+    });
+
+    const result = await abortActive({ preferActive: true });
+
+    expect(abortChat).toHaveBeenCalledWith({
+      sessionKey: "agent:main:main",
+      runId: "run-pending",
+    });
+    expect(abortChat).toHaveBeenCalledWith({
+      sessionKey: "agent:main:main",
+      runId: "run-active",
+    });
+    expect(result).toEqual({
+      aborted: true,
+      runId: "run-pending",
+      restoredDraftText: "restore me",
+    });
+    expect(state.pendingSubmitDraft).toBeNull();
+    expect(state.pendingOptimisticUserMessage).toBe(false);
+    expect(chatLog.countPendingUsers()).toBe(0);
+    expect(chatLog.render(120).join("\n")).not.toContain("restore me");
   });
 
   it("passes the selected agent when aborting selected global runs", async () => {

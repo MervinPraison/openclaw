@@ -270,6 +270,12 @@ export function createEventHandlers(context: EventHandlerContext) {
     pruneRunMap(sessionRuns);
   };
 
+  const markSubmittedRunRegistered = (runId: string) => {
+    if (state.pendingSubmitDraft?.runId === runId) {
+      state.pendingSubmitDraft = null;
+    }
+  };
+
   const noteFinalizedRun = (runId: string, opts?: { displayedFinal?: boolean }) => {
     finalizedRuns.set(runId, Date.now());
     completedRuns.set(runId, Date.now());
@@ -572,6 +578,7 @@ export function createEventHandlers(context: EventHandlerContext) {
     clearPendingTerminalLifecycleError(evt.runId);
     chatLog.dismissPendingSystem(evt.runId);
     noteSessionRun(evt.runId);
+    markSubmittedRunRegistered(evt.runId);
     const isPendingChatRun = state.pendingChatRunId === evt.runId;
     const isLocalChatRun = isLocalRunId?.(evt.runId) ?? false;
     const isLocalBtwRun = isLocalBtwRunId?.(evt.runId) ?? false;
@@ -749,6 +756,7 @@ export function createEventHandlers(context: EventHandlerContext) {
     if (evt.stream === "lifecycle") {
       if (isPendingRun) {
         noteSessionRun(evt.runId);
+        markSubmittedRunRegistered(evt.runId);
         state.activeChatRunId = evt.runId;
         state.pendingChatRunId = null;
         if (state.pendingOptimisticUserMessage) {
