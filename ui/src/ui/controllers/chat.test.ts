@@ -799,6 +799,43 @@ describe("handleChatEvent", () => {
     expect(state.chatStream).toBe(null);
   });
 
+  it("keeps repeated assistant final text from a later turn", () => {
+    const firstUser = {
+      role: "user",
+      content: [{ type: "text", text: "first" }],
+      timestamp: 1,
+    };
+    const firstAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "OK" }],
+      timestamp: 2,
+    };
+    const secondUser = {
+      role: "user",
+      content: [{ type: "text", text: "second" }],
+      timestamp: 3,
+    };
+    const secondAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "OK" }],
+      timestamp: 4,
+    };
+    const state = createState({
+      sessionKey: "main",
+      chatRunId: "run-2",
+      chatMessages: [firstUser, firstAssistant, secondUser],
+    });
+    const payload: ChatEventPayload = {
+      runId: "run-2",
+      sessionKey: "main",
+      state: "final",
+      message: secondAssistant,
+    };
+
+    expect(handleChatEvent(state, payload)).toBe("final");
+    expect(state.chatMessages).toEqual([firstUser, firstAssistant, secondUser, secondAssistant]);
+  });
+
   it("appends final payload message from own run before clearing stream state", () => {
     const state = createState({
       sessionKey: "main",
