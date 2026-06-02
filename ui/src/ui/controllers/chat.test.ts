@@ -2265,6 +2265,7 @@ describe("loadChatHistory retry handling", () => {
       toolCallId: "call_1",
       toolName: "shell",
       content: [{ type: "text", text: "tool output" }],
+      timestamp: 2,
       __openclaw: { seq: 2 },
     };
     const request = vi.fn().mockResolvedValue({
@@ -2296,6 +2297,7 @@ describe("loadChatHistory retry handling", () => {
     expect(state.chatMessages).toHaveLength(3);
     expect(state.chatMessages[0]).toEqual(persistedUser);
     expectTextChatMessage(state.chatMessages[1], "assistant", "before tool");
+    expect(requireRecord(state.chatMessages[1]).timestamp).toBe(1);
     expect(state.chatMessages[2]).toEqual(persistedToolResult);
     expect(state.chatRunId).toBe("run-1");
     expect(state.chatStream).toBe("Still answering.");
@@ -2382,6 +2384,7 @@ describe("loadChatHistory retry handling", () => {
           arguments: {},
         },
       ],
+      timestamp: 2,
       __openclaw: { seq: 2 },
     };
     const request = vi.fn().mockResolvedValue({
@@ -2420,6 +2423,7 @@ describe("loadChatHistory retry handling", () => {
     expect(state.chatMessages).toHaveLength(3);
     expect(state.chatMessages[0]).toEqual(persistedUser);
     expectTextChatMessage(state.chatMessages[1], "assistant", "before tool");
+    expect(requireRecord(state.chatMessages[1]).timestamp).toBe(1);
     expect(state.chatMessages[2]).toEqual(persistedToolCall);
     expect(state.chatRunId).toBe("run-1");
     expect(state.chatStream).toBe("Still answering.");
@@ -2441,6 +2445,7 @@ describe("loadChatHistory retry handling", () => {
       toolCallId: "call_1",
       toolName: "shell",
       content: [{ type: "text", text: "tool output" }],
+      timestamp: 2,
       __openclaw: { seq: 2 },
     };
     const request = vi.fn().mockResolvedValue({
@@ -2472,6 +2477,7 @@ describe("loadChatHistory retry handling", () => {
     expect(state.chatMessages).toHaveLength(3);
     expect(state.chatMessages[0]).toEqual(persistedUser);
     expectTextChatMessage(state.chatMessages[1], "assistant", "before tool");
+    expect(requireRecord(state.chatMessages[1]).timestamp).toBe(1);
     expect(state.chatMessages[2]).toEqual(persistedToolResult);
     expect(state.chatRunId).toBe("run-1");
     expect(state.chatStream).toBeNull();
@@ -2594,6 +2600,58 @@ describe("loadChatHistory retry handling", () => {
     expect(state.chatMessages).toEqual([persistedUser, historyAssistant]);
     expect(state.chatStream).toBeNull();
     expect(state.chatStreamStartedAt).toBeNull();
+  });
+
+  it("keeps live tool cards when history only replaces streamed text", async () => {
+    const persistedUser = {
+      role: "user",
+      content: [{ type: "text", text: "latest ask" }],
+      __openclaw: { seq: 1 },
+    };
+    const historyAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "First visible stream text. More final text." }],
+      __openclaw: { seq: 2 },
+    };
+    const liveToolMessage = {
+      role: "assistant",
+      toolCallId: "call_current",
+      runId: "run-1",
+      content: [{ type: "toolcall", name: "shell", arguments: {} }],
+    };
+    const request = vi.fn().mockResolvedValue({
+      messages: [persistedUser, historyAssistant],
+      thinkingLevel: "low",
+    });
+    const state = createState({
+      connected: true,
+      client: { request } as unknown as ChatState["client"],
+      chatMessages: [persistedUser],
+      chatRunId: "run-1",
+      chatStream: "First visible stream text.",
+      chatStreamStartedAt: 100,
+    }) as ChatState & {
+      chatStreamSegments: Array<{ text: string; ts: number }>;
+      chatToolMessages: Record<string, unknown>[];
+      toolStreamById: Map<string, unknown>;
+      toolStreamOrder: string[];
+      toolStreamSyncTimer: number | null;
+    };
+    state.chatStreamSegments = [{ text: "First visible stream text.", ts: 90 }];
+    state.chatToolMessages = [liveToolMessage];
+    state.toolStreamById = new Map([["call_current", { message: liveToolMessage }]]);
+    state.toolStreamOrder = ["call_current"];
+    state.toolStreamSyncTimer = null;
+
+    await loadChatHistory(state);
+
+    expect(state.chatMessages).toEqual([persistedUser, historyAssistant]);
+    expect(state.chatStream).toBeNull();
+    expect(state.chatStreamStartedAt).toBeNull();
+    expect(state.chatToolMessages).toEqual([liveToolMessage]);
+    expect(state.chatStreamSegments).toEqual([]);
+    expect(state.toolStreamById.size).toBe(1);
+    expect(state.toolStreamOrder).toEqual(["call_current"]);
   });
 
   it("keeps local optimistic messages when history reload returns empty", async () => {
