@@ -1,11 +1,10 @@
 // Client script for minimal OpenAI web-search E2E scenarios.
 import { readdirSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { readTcpPortEnv } from "../env-limits.mjs";
 
 async function loadCallGateway() {
   const candidates = readdirSync("/app/dist")
-    .filter((name) => /^call(?:\.runtime)?-[A-Za-z0-9_-]+\.m?js$/.test(name))
+    .filter((name) => /^call(?:\.runtime)?-[A-Za-z0-9_-]+\.js$/.test(name))
     .toSorted();
   for (const name of candidates) {
     const mod = await import(pathToFileURL(`/app/dist/${name}`).href);
@@ -25,20 +24,12 @@ function readExpectedRawSchemaError() {
   return process.env.RAW_SCHEMA_ERROR?.trim() || DEFAULT_RAW_SCHEMA_ERROR;
 }
 
-function resolveGatewayPort(env = process.env) {
-  const portText = env.PORT;
-  if (!portText) {
-    throw new Error("missing PORT");
-  }
-  return readTcpPortEnv("PORT", portText, env);
-}
-
 async function gatewayAgent(params) {
+  const port = process.env.PORT;
   const token = process.env.OPENCLAW_GATEWAY_TOKEN;
-  if (!token) {
+  if (!port || !token) {
     throw new Error("missing PORT/OPENCLAW_GATEWAY_TOKEN");
   }
-  const port = resolveGatewayPort();
 
   try {
     const callGateway = await loadCallGateway();
@@ -162,9 +153,23 @@ async function main() {
     return;
   }
   if (!result.ok) {
-    throw /** @type {Error} */ (result.error);
+    throw toLintErrorObject(result.error, "Non-Error thrown");
   }
   validateSuccessResult(result);
+}
+
+function toLintErrorObject(value, fallbackMessage) {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
@@ -180,7 +185,7 @@ export const testing = {
   DEFAULT_GATEWAY_SCHEMA_ERROR,
   DEFAULT_RAW_SCHEMA_ERROR,
   SUCCESS_MARKER,
-  resolveGatewayPort,
+  extractSuccessReplyTexts,
   validateSuccessResult,
   validateRejectResult,
 };

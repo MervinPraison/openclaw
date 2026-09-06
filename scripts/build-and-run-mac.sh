@@ -1,26 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP_DIR="$ROOT_DIR/apps/macos"
-
-usage() {
-  printf 'Usage: %s\n' "$(basename "$0")"
-  printf 'Build, stop, and relaunch the local debug OpenClaw macOS app.\n'
-}
-
-for arg in "$@"; do
-  case "$arg" in
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    --) ;;
-    *) printf 'ERROR: Unknown build-and-run-mac option: %s\n' "$arg" >&2; exit 1 ;;
-  esac
-done
-
-cd "$APP_DIR"
+cd "$(dirname "$0")/../apps/macos"
 
 BUILD_PATH=".build-local"
 PRODUCT="OpenClaw"
@@ -64,7 +44,6 @@ stop_existing_local_app() {
 }
 
 printf "\n▶️  Building $PRODUCT (debug, build path: $BUILD_PATH)\n"
-node "$ROOT_DIR/scripts/prepare-apple-mermaid.mjs"
 swift build -c debug --product "$PRODUCT" --build-path "$BUILD_PATH"
 
 printf "\n⏹  Stopping existing $PRODUCT...\n"

@@ -1,6 +1,4 @@
 // Plans release workflow matrix entries from profile and suite inputs.
-import { isDirectRunUrl } from "./lib/direct-run.mjs";
-
 const DOCKER_E2E_CHUNKS = [
   {
     chunk_id: "core",
@@ -10,25 +8,19 @@ const DOCKER_E2E_CHUNKS = [
   },
   {
     chunk_id: "package-update-openai",
-    label: "package/update OpenAI and recovery",
+    label: "package/update OpenAI install",
     timeout_minutes: 45,
     profiles: "beta minimum stable full",
   },
   {
-    chunk_id: "package-update-onboarding",
-    label: "package/update onboarding",
+    chunk_id: "package-update-anthropic",
+    label: "package/update Anthropic install",
     timeout_minutes: 60,
     profiles: "beta minimum stable full",
   },
   {
-    chunk_id: "package-update-migrations",
-    label: "package/update migrations",
-    timeout_minutes: 60,
-    profiles: "beta minimum stable full",
-  },
-  {
-    chunk_id: "package-update-self-upgrade",
-    label: "package/update self-upgrade",
+    chunk_id: "package-update-core",
+    label: "package/update core",
     timeout_minutes: 60,
     profiles: "beta minimum stable full",
   },
@@ -108,14 +100,7 @@ const LIVE_MODEL_PROVIDERS = [
   {
     provider_label: "MiniMax",
     providers: "minimax",
-    models: "minimax/MiniMax-M3,minimax-portal/MiniMax-M3",
-    max_models: "2",
     profiles: "stable full",
-  },
-  {
-    provider_label: "Moonshot",
-    providers: "moonshot",
-    profiles: "full",
   },
   {
     provider_label: "OpenAI",
@@ -250,7 +235,7 @@ function writeOutputs(plan) {
   }
 }
 
-if (isDirectRunUrl(process.argv[1], import.meta.url)) {
+if (import.meta.url === `file://${process.argv[1]}`) {
   const plan = createReleaseWorkflowMatrixPlan({
     dockerLanes: process.env.DOCKER_LANES,
     includeLiveSuites: process.env.INCLUDE_LIVE_SUITES,

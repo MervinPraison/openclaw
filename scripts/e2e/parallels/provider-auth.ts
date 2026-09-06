@@ -4,11 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { parsePositiveInt, readPositiveIntEnv } from "./env-limits.ts";
 import { die, run } from "./host-command.ts";
-import * as frozenProviderAuth from "./provider-auth-prerequisite.mjs";
 import type { Mode, Platform, Provider, ProviderAuth } from "./types.ts";
 
 type ResolveLatestVersionDeps = {
-  createTempDir?: (prefix: string) => string;
+  createTempDir?: typeof mkdtempSync;
   removeDir?: typeof rmSync;
   runCommand?: typeof run;
   tempDir?: typeof tmpdir;
@@ -21,7 +20,7 @@ export function parseBoolEnv(value: string | undefined): boolean {
 
 export function ensureValue(args: string[], index: number, flag: string): string {
   const value = args[index + 1];
-  if (value == null || value === "" || value.startsWith("-")) {
+  if (value == null || value === "") {
     die(`${flag} requires a value`);
   }
   return value;
@@ -31,17 +30,56 @@ export function resolveProviderAuth(input: {
   provider: Provider;
   apiKeyEnv?: string;
   modelId?: string;
-  platform?: Platform;
 }): ProviderAuth {
-  const result = frozenProviderAuth.resolveParallelsProviderAuth(input, process.env);
-  if (result.status === "blocked") {
-    die(`${result.auth.apiKeyEnv} is required`);
+  const providerDefaults: Record<Provider, Omit<ProviderAuth, "apiKeyValue">> = {
+    anthropic: {
+      apiKeyEnv: input.apiKeyEnv || "ANTHROPIC_API_KEY",
+      authChoice: "apiKey",
+      authKeyFlag: "anthropic-api-key",
+      modelId:
+        input.modelId ||
+        process.env.OPENCLAW_PARALLELS_ANTHROPIC_MODEL ||
+        "anthropic/claude-sonnet-4-6",
+    },
+    minimax: {
+      apiKeyEnv: input.apiKeyEnv || "MINIMAX_API_KEY",
+      authChoice: "minimax-global-api",
+      authKeyFlag: "minimax-api-key",
+      modelId:
+        input.modelId || process.env.OPENCLAW_PARALLELS_MINIMAX_MODEL || "minimax/MiniMax-M2.7",
+    },
+    openai: {
+      apiKeyEnv: input.apiKeyEnv || "OPENAI_API_KEY",
+      authChoice: "openai-api-key",
+      authKeyFlag: "openai-api-key",
+      modelId: input.modelId || process.env.OPENCLAW_PARALLELS_OPENAI_MODEL || "openai/gpt-5.5",
+    },
+  };
+  const resolved = providerDefaults[input.provider];
+  const apiKeyValue = process.env[resolved.apiKeyEnv] ?? "";
+  if (!apiKeyValue) {
+    die(`${resolved.apiKeyEnv} is required`);
   }
-  return result.auth;
+  return { ...resolved, apiKeyValue };
 }
 
-export function resolveWindowsProviderAuth(input: Parameters<typeof resolveProviderAuth>[0]) {
-  return resolveProviderAuth({ ...input, platform: "windows" });
+export function resolveWindowsProviderAuth(input: {
+  provider: Provider;
+  apiKeyEnv?: string;
+  modelId?: string;
+}): ProviderAuth {
+  const auth = resolveProviderAuth(input);
+  if (input.provider !== "openai" || input.modelId) {
+    return auth;
+  }
+  const windowsModel = process.env.OPENCLAW_PARALLELS_WINDOWS_OPENAI_MODEL?.trim();
+  if (windowsModel) {
+    return { ...auth, modelId: windowsModel };
+  }
+  if (process.env.OPENCLAW_PARALLELS_OPENAI_MODEL?.trim()) {
+    return auth;
+  }
+  return { ...auth, modelId: "openai/gpt-5.5" };
 }
 
 export function providerIdFromModelId(modelId: string): string {
@@ -62,7 +100,7 @@ export function resolveParallelsModelTimeoutSeconds(platform?: Platform): number
   return readPositiveIntEnv("OPENCLAW_PARALLELS_MODEL_TIMEOUT_S", defaultSeconds);
 }
 
-function providerTimeoutConfigJson(
+export function providerTimeoutConfigJson(
   modelId: string,
   platform: Platform,
   timeoutSeconds = resolveParallelsModelTimeoutSeconds(platform),
@@ -90,7 +128,7 @@ function providerTimeoutConfigJson(
   });
 }
 
-function modelTransportConfigJson(modelId: string): string {
+export function modelTransportConfigJson(modelId: string): string {
   if (providerIdFromModelId(modelId) !== "openai") {
     return "";
   }
@@ -102,7 +140,7 @@ function modelTransportConfigJson(modelId: string): string {
   });
 }
 
-function configPathMapKey(key: string): string {
+export function configPathMapKey(key: string): string {
   return `[${JSON.stringify(key)}]`;
 }
 
@@ -145,11 +183,22 @@ export function parseMode(value: string): Mode {
 }
 
 export function parsePlatformList(value: string): Set<Platform> {
-  try {
-    return frozenProviderAuth.parsePlatformList(value);
-  } catch (error) {
-    return die((error as Error).message);
+  const normalized = value.replaceAll(" ", "");
+  if (normalized === "all") {
+    return new Set(["macos", "windows", "linux"]);
   }
+  const result = new Set<Platform>();
+  for (const entry of normalized.split(",")) {
+    if (entry === "macos" || entry === "windows" || entry === "linux") {
+      result.add(entry);
+    } else {
+      die(`invalid --platform entry: ${entry}`);
+    }
+  }
+  if (result.size === 0) {
+    die("--platform must include at least one platform");
+  }
+  return result;
 }
 
 export function resolveLatestVersion(

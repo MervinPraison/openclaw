@@ -1,10 +1,9 @@
 // Firecrawl Compare script supports OpenClaw repository automation.
 import { pathToFileURL } from "node:url";
-import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { fetchFirecrawlContent } from "../extensions/firecrawl/api.ts";
+import { extractReadableContent } from "../src/agents/tools/web-tools.js";
 import { formatErrorMessage } from "../src/infra/errors.ts";
-import { extractReadableContent } from "../src/web-fetch/content-extractors.runtime.js";
-import { readBoundedResponseText as readBoundedResponseTextWithLimit } from "./lib/bounded-response.mjs";
+import { readBoundedResponseText as readBoundedResponseTextWithLimit } from "./lib/bounded-response.ts";
 
 const DEFAULT_URLS = [
   "https://en.wikipedia.org/wiki/Web_scraping",
@@ -33,7 +32,7 @@ function truncate(value: string, max = 180): string {
   if (!value) {
     return "";
   }
-  return value.length > max ? `${truncateUtf16Safe(value, max)}…` : value;
+  return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
 function readBoundedResponseText(
@@ -43,7 +42,7 @@ function readBoundedResponseText(
   maxBytes = FETCH_HTML_MAX_BYTES,
 ): Promise<string> {
   return readBoundedResponseTextWithLimit(response, label, maxBytes, {
-    createTooLargeError: (message: string) => new Error(message),
+    createTooLargeError: (message) => new Error(message),
     signal,
   });
 }
@@ -174,6 +173,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
 }
 
 export const testing = {
+  FETCH_HTML_MAX_BYTES,
   fetchHtml,
-  truncate,
+  readBoundedResponseText,
 };

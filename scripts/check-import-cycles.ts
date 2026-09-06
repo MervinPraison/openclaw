@@ -104,7 +104,7 @@ function collectRuntimeStaticImports(
     file,
     readFileSync(path.join(repoRoot, file), "utf8"),
     ts.ScriptTarget.Latest,
-    false,
+    true,
   );
   const imports: string[] = [];
   const visit = (node: ts.Node) => {

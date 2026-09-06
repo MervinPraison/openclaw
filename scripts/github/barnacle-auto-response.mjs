@@ -1,23 +1,24 @@
 // Barnacle owns deterministic GitHub triage and auto-response behavior.
 
-import { escapeRegExp } from "../lib/regexp.mjs";
 import {
-  NEEDS_PR_CONTEXT_LABEL,
+  MOCK_ONLY_PROOF_LABEL,
+  NEEDS_REAL_BEHAVIOR_PROOF_LABEL,
+  PROOF_OVERRIDE_LABEL,
   PROOF_SUFFICIENT_LABEL,
-  evaluatePullRequestContext,
-  hasAuthoredPullRequestSection,
-  labelsForPullRequestContext,
+  PROOF_SUPPLIED_LABEL,
+  evaluateRealBehaviorProof,
+  hasClawSweeperExactHeadProof,
+  labelsForRealBehaviorProof,
 } from "./real-behavior-proof-policy.mjs";
 
 const activePrLimit = 20;
-const skillCloseLabel = "r: skill";
 
 const thirdPartyExtensionMessage =
   "Please publish this as a third-party plugin on [ClawHub](https://clawhub.ai) instead of adding it to the core repo. Docs: https://docs.openclaw.ai/plugin and https://docs.openclaw.ai/clawhub";
 
 const rules = [
   {
-    label: skillCloseLabel,
+    label: "r: skill",
     close: true,
     message:
       "Thanks for the contribution! New skills should be published on [ClawHub](https://clawhub.ai) for everyone to use. We’re keeping the core lean on skills, so I’m closing this out.",
@@ -78,9 +79,8 @@ const rules = [
   },
 ];
 
-/** @type {Record<string, { color: string; description: string }>} */
 export const managedLabelSpecs = {
-  [skillCloseLabel]: {
+  "r: skill": {
     color: "5319E7",
     description: "Auto-close: skills should be published on ClawHub, not added to core.",
   },
@@ -156,9 +156,25 @@ export const managedLabelSpecs = {
     color: "C5DEF5",
     description: "Candidate: PR template appears mostly untouched.",
   },
-  [NEEDS_PR_CONTEXT_LABEL]: {
+  [NEEDS_REAL_BEHAVIOR_PROOF_LABEL]: {
     color: "C5DEF5",
-    description: "Candidate: external PR body lacks required problem context or evidence.",
+    description: "Candidate: external PR needs after-fix proof from a real setup.",
+  },
+  [MOCK_ONLY_PROOF_LABEL]: {
+    color: "C5DEF5",
+    description: "Candidate: PR proof only shows tests, mocks, snapshots, lint, typecheck, or CI.",
+  },
+  [PROOF_SUPPLIED_LABEL]: {
+    color: "C2E0C6",
+    description: "External PR includes structured after-fix real behavior proof.",
+  },
+  [PROOF_SUFFICIENT_LABEL]: {
+    color: "0E8A16",
+    description: "ClawSweeper judged the real behavior proof convincing.",
+  },
+  [PROOF_OVERRIDE_LABEL]: {
+    color: "C2E0C6",
+    description: "Maintainer override for the external PR real behavior proof gate.",
   },
   "triage: dirty-candidate": {
     color: "C5DEF5",
@@ -180,7 +196,8 @@ export const candidateLabels = {
   docsDiscoverability: "triage: docs-discoverability",
   testOnlyNoBug: "triage: test-only-no-bug",
   refactorOnly: "triage: refactor-only",
-  needsPrContext: NEEDS_PR_CONTEXT_LABEL,
+  needsRealBehaviorProof: NEEDS_REAL_BEHAVIOR_PROOF_LABEL,
+  mockOnlyProof: MOCK_ONLY_PROOF_LABEL,
   dirtyCandidate: "triage: dirty-candidate",
   riskyInfra: "triage: risky-infra",
   externalPluginCandidate: "triage: external-plugin-candidate",
@@ -223,16 +240,26 @@ const maintainerAuthorLabel = "maintainer";
 const privilegedAuthorAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const privilegedRepositoryRoles = new Set(["admin", "maintain", "write"]);
 const candidateLabelValues = Object.values(candidateLabels);
-const structuralContextLabelValues = [NEEDS_PR_CONTEXT_LABEL, skillCloseLabel];
+const structuralProofLabelValues = [
+  NEEDS_REAL_BEHAVIOR_PROOF_LABEL,
+  MOCK_ONLY_PROOF_LABEL,
+  PROOF_SUPPLIED_LABEL,
+];
 const noisyPrMessage =
   "Closing this PR because it looks dirty (too many unrelated or unexpected changes). This usually happens when a branch picks up unrelated commits or a merge went sideways. Please recreate the PR from a clean branch.";
 
 const candidateActionRules = [
   {
-    label: candidateLabels.needsPrContext,
+    label: candidateLabels.needsRealBehaviorProof,
     close: true,
     message:
-      "Closing this PR because its body lacks a clear problem statement or evidence. Please reopen or resubmit with the user, product, or operational problem and the most useful validation evidence, such as a focused test, CI result, screenshot, recording, terminal output, log, or artifact.",
+      "Closing this PR because it does not include real behavior proof. Please reopen or resubmit with after-fix evidence from a real OpenClaw setup; terminal screenshots, console output, redacted logs, recordings, linked artifacts, and copied live output count. Unit tests, mocks, snapshots, lint, typechecks, and CI are supplemental only.",
+  },
+  {
+    label: candidateLabels.mockOnlyProof,
+    close: true,
+    message:
+      "Closing this PR because the proof only shows tests, mocks, snapshots, lint, typechecks, or CI. Please reopen or resubmit with after-fix evidence from a real OpenClaw setup; terminal screenshots, console output, redacted logs, recordings, linked artifacts, and copied live output count.",
   },
   {
     label: candidateLabels.dirtyCandidate,
@@ -297,7 +324,7 @@ function extractIssueFormValue(body, field) {
   if (!body) {
     return "";
   }
-  const escapedField = escapeRegExp(field);
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const regex = new RegExp(
     `(?:^|\\n)###\\s+${escapedField}\\s*\\n([\\s\\S]*?)(?=\\n###\\s+|$)`,
     "i",
@@ -320,7 +347,7 @@ function hasLinkedReference(text) {
 }
 
 function hasFilledTemplateLine(body, field) {
-  const escapedField = escapeRegExp(field);
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const regex = new RegExp(`^\\s*-\\s*${escapedField}:\\s*\\S`, "im");
   return regex.test(body);
 }
@@ -329,7 +356,7 @@ function hasMostlyBlankTemplate(body) {
   if (!body) {
     return true;
   }
-  const legacyEmptyFields = [
+  const emptyFields = [
     "Problem",
     "Why it matters",
     "What changed",
@@ -337,26 +364,17 @@ function hasMostlyBlankTemplate(body) {
     "Root cause",
     "Target test or file",
   ].filter((field) => {
-    const escapedField = escapeRegExp(field);
+    const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const regex = new RegExp(`^\\s*-\\s*${escapedField}(?: \\([^)]*\\))?:\\s*$`, "im");
     return regex.test(body);
   }).length;
-  const hasLegacyTemplateIntro = body.includes("Describe the problem and fix in 2–5 bullets");
+  const hasTemplateIntro = body.includes("Describe the problem and fix in 2–5 bullets");
   const emptyClosingRef = /^\s*-\s*(?:Closes|Related)\s+#\s*$/im.test(body);
-  const hasNewTemplateIntro = body.includes(
-    "Describe the concrete user, product, or operational problem.",
-  );
-  return (
-    (hasLegacyTemplateIntro && legacyEmptyFields >= 3 && emptyClosingRef) ||
-    (hasNewTemplateIntro &&
-      !hasAuthoredPullRequestSection("What Problem This Solves", body) &&
-      !hasAuthoredPullRequestSection("Evidence", body))
-  );
+  return hasTemplateIntro && emptyFields >= 3 && emptyClosingRef;
 }
 
 function stripPullRequestTemplateBoilerplate(text) {
   return text
-    .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/^#{2,3}\s+.*$/gm, "")
     .replace(/^-\s*\[[ xX]\]\s+.*$/gm, "")
     .replace(/^-\s*(?:Closes|Related)\s+#\s*$/gim, "")
@@ -377,9 +395,6 @@ function stripPullRequestTemplateBoilerplate(text) {
 
 function hasConcreteBehaviorContext(body, text) {
   if (hasLinkedReference(text)) {
-    return true;
-  }
-  if (hasAuthoredPullRequestSection("What Problem This Solves", body)) {
     return true;
   }
   if (
@@ -436,31 +451,6 @@ function isInfraLikeFile(filename) {
   );
 }
 
-function isStandaloneSkillSubmission(files) {
-  // Auto-close only whole submissions; rename sources stop core files from
-  // acquiring the destructive skill label by moving under a new skill root.
-  const addedSkillRoots = files
-    .filter(
-      (file) => file.status === "added" && /^skills\/(?:[^/]+\/)+SKILL\.md$/i.test(file.filename),
-    )
-    .map((file) => file.filename.slice(0, -"SKILL.md".length).toLowerCase());
-  const isInAddedSkillRoot = (filename) => {
-    const normalizedFilename = filename.toLowerCase();
-    return addedSkillRoots.some((root) => normalizedFilename.startsWith(root));
-  };
-
-  return (
-    addedSkillRoots.length > 0 &&
-    files.every(
-      (file) =>
-        isInAddedSkillRoot(file.filename) &&
-        (file.status !== "renamed" ||
-          (typeof file.previous_filename === "string" &&
-            isInAddedSkillRoot(file.previous_filename))),
-    )
-  );
-}
-
 function surfacesForFile(filename) {
   const surfaces = new Set();
   if (/\.generated\/|generated|\.snap$/i.test(filename)) {
@@ -496,7 +486,6 @@ export function classifyPullRequestCandidateLabels(pullRequest, files) {
   const filenames = files.map((file) => file.filename);
   const body = pullRequest.body ?? "";
   const text = `${pullRequest.title ?? ""}\n${body}`;
-  const contentText = stripPullRequestTemplateBoilerplate(text);
   const lowerText = text.toLowerCase();
   const linkedReference = hasLinkedReference(text);
   const blankTemplate = hasMostlyBlankTemplate(body);
@@ -511,8 +500,8 @@ export function classifyPullRequestCandidateLabels(pullRequest, files) {
   }
 
   labelsToAdd.push(
-    ...labelsForPullRequestContext(
-      evaluatePullRequestContext({
+    ...labelsForRealBehaviorProof(
+      evaluateRealBehaviorProof({
         pullRequest,
       }),
     ),
@@ -555,7 +544,7 @@ export function classifyPullRequestCandidateLabels(pullRequest, files) {
   if (
     !linkedReference &&
     !concreteBehaviorContext &&
-    /\b(refactor|cleanup|clean up|rename|formatting|style-only|style only)\b/i.test(contentText)
+    /\b(refactor|cleanup|clean up|rename|formatting|style-only|style only)\b/i.test(text)
   ) {
     labelsToAdd.push(candidateLabels.refactorOnly);
   }
@@ -574,10 +563,6 @@ export function classifyPullRequestCandidateLabels(pullRequest, files) {
       /\b(third[- ]party|external plugin|community plugin|clawhub)\b/i.test(lowerText))
   ) {
     labelsToAdd.push(candidateLabels.externalPluginCandidate);
-  }
-
-  if (isStandaloneSkillSubmission(files)) {
-    labelsToAdd.push(skillCloseLabel);
   }
 
   const surfaces = new Set(filenames.flatMap(surfacesForFile));
@@ -783,6 +768,15 @@ async function listPullRequestFiles(github, context, pullRequest) {
   });
 }
 
+async function listIssueComments(github, context, issueNumber) {
+  return github.paginate(github.rest.issues.listComments, {
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    issue_number: issueNumber,
+    per_page: 100,
+  });
+}
+
 async function addMissingLabels(github, context, core, issueNumber, labels, labelSet) {
   const missingLabels = labels.filter((label) => !labelSet.has(label));
   if (missingLabels.length === 0) {
@@ -804,26 +798,90 @@ function isClawSweeperOwnedLabel(label) {
   return label === "clawsweeper" || label.startsWith("clawsweeper:");
 }
 
+function isActiveClawSweeperWork(pullRequest, labelSet) {
+  const authorLogin = pullRequest.user?.login ?? "";
+  const headRef = pullRequest.head?.ref ?? "";
+  return (
+    /clawsweeper/i.test(authorLogin) ||
+    headRef.startsWith("clawsweeper/") ||
+    [...labelSet].some(isClawSweeperOwnedLabel)
+  );
+}
+
+function shouldRemoveProofSufficientLabel(
+  context,
+  pullRequest,
+  labelSet,
+  proofEvaluation,
+  hasExactHeadClawSweeperProof,
+) {
+  if (hasExactHeadClawSweeperProof) {
+    return false;
+  }
+  if (proofEvaluation.status === "override") {
+    return false;
+  }
+  if (isActiveClawSweeperWork(pullRequest, labelSet)) {
+    return false;
+  }
+  if (!["edited", "synchronize"].includes(context.payload.action)) {
+    return false;
+  }
+  if (proofEvaluation.status !== "passed") {
+    return true;
+  }
+  return true;
+}
+
+const negativeProofLabels = new Set([NEEDS_REAL_BEHAVIOR_PROOF_LABEL, MOCK_ONLY_PROOF_LABEL]);
+
+function shouldPreserveClawSweeperProofJudgment(context, labelSet) {
+  return (
+    labelSet.has(PROOF_SUFFICIENT_LABEL) &&
+    !["edited", "synchronize"].includes(context.payload.action)
+  );
+}
+
 async function applyPullRequestCandidateLabels(github, context, core, pullRequest, labelSet) {
   const files = await listPullRequestFiles(github, context, pullRequest);
-  const candidateLabelsToApply = classifyPullRequestCandidateLabels(
+  const hasExactHeadClawSweeperProof =
+    labelSet.has(PROOF_SUFFICIENT_LABEL) &&
+    hasClawSweeperExactHeadProof({
+      pullRequest,
+      comments: await listIssueComments(github, context, pullRequest.number),
+    });
+  const proofEvaluation = evaluateRealBehaviorProof({
+    pullRequest: {
+      ...pullRequest,
+      labels: [...labelSet].map((name) => ({ name })),
+    },
+  });
+  const classifiedLabels = classifyPullRequestCandidateLabels(
     {
       ...pullRequest,
       labels: [...labelSet].map((name) => ({ name })),
     },
     files,
   );
-  const preserveSkillCloseLabel =
-    context.payload.action === "labeled" &&
-    context.payload.label?.name === skillCloseLabel &&
-    !isAutomationActor(context);
-  const staleContextLabels = structuralContextLabelValues.filter(
-    (label) =>
-      (!preserveSkillCloseLabel || label !== skillCloseLabel) &&
-      labelSet.has(label) &&
-      !candidateLabelsToApply.includes(label),
+  const candidateLabelsToApply = shouldPreserveClawSweeperProofJudgment(context, labelSet)
+    ? classifiedLabels.filter((label) => !negativeProofLabels.has(label))
+    : classifiedLabels;
+  const staleProofLabels = structuralProofLabelValues.filter(
+    (label) => labelSet.has(label) && !candidateLabelsToApply.includes(label),
   );
-  await removeLabels(github, context, pullRequest.number, staleContextLabels, labelSet);
+  if (
+    labelSet.has(PROOF_SUFFICIENT_LABEL) &&
+    shouldRemoveProofSufficientLabel(
+      context,
+      pullRequest,
+      labelSet,
+      proofEvaluation,
+      hasExactHeadClawSweeperProof,
+    )
+  ) {
+    staleProofLabels.push(PROOF_SUFFICIENT_LABEL);
+  }
+  await removeLabels(github, context, pullRequest.number, staleProofLabels, labelSet);
   await addMissingLabels(
     github,
     context,
@@ -936,13 +994,6 @@ async function removeLabels(github, context, issueNumber, labels, labelSet) {
   }
 }
 
-/**
- * @param {{
- *   github: Record<string, unknown>;
- *   context: Record<string, unknown>;
- *   core?: Pick<Console, "info">;
- * }} params
- */
 export async function runBarnacleAutoResponse({ github, context, core = console }) {
   const target = context.payload.issue ?? context.payload.pull_request;
   if (!target) {
@@ -1055,7 +1106,6 @@ export async function runBarnacleAutoResponse({ github, context, core = console 
   }
 
   const isLabelEvent = context.payload.action === "labeled";
-  const eventLabel = context.payload.label?.name ?? "";
   const isPrCandidateEvent =
     pullRequest &&
     ["opened", "edited", "synchronize", "reopened", "labeled", "unlabeled"].includes(
@@ -1124,13 +1174,6 @@ export async function runBarnacleAutoResponse({ github, context, core = console 
     }
 
     await applyPullRequestCandidateLabels(github, context, core, pullRequest, labelSet);
-
-    if (isLabelEvent && eventLabel === skillCloseLabel && isAutomationActor(context)) {
-      core.info(
-        `Skipping duplicate PR auto-response for automation-applied ${skillCloseLabel} on #${pullRequest.number}.`,
-      );
-      return;
-    }
 
     if (labelSet.has(dirtyLabel)) {
       await github.rest.issues.createComment({

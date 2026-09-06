@@ -1,11 +1,8 @@
 // Assertions for Codex on-demand plugin E2E scenarios.
 import fs from "node:fs";
 import path from "node:path";
-import {
-  assertNoLegacyPrimaryAuthRows,
-  assertOpenAiEnvAuthProfileStore,
-  readCanonicalAuthProfileStoreText,
-} from "../auth-profile-store-assertions.mjs";
+import { DatabaseSync } from "node:sqlite";
+import { assertOpenAiEnvAuthProfileStore } from "../auth-profile-store-assertions.mjs";
 import {
   assertPathInside,
   configPath,
@@ -16,31 +13,23 @@ import {
   readJson,
   stateDir,
 } from "../codex-install-utils.mjs";
-import { assertCodexReleasePackageContract } from "../codex-release-package-assertions.mjs";
 
 const cfg = readJson(configPath());
-const onboard = readJson("/tmp/openclaw-onboard.json");
 const inspect = readJson("/tmp/openclaw-codex-inspect.json");
-const records = readInstallRecords();
-const codexRecord = records.codex;
-if (onboard.ok !== true || onboard.mode !== "local" || onboard.authChoice !== "openai-api-key") {
-  throw new Error(`unexpected onboarding terminal result: ${JSON.stringify(onboard)}`);
-}
-if (cfg.plugins?.installs !== undefined) {
-  throw new Error("codex install record remained in config instead of the canonical SQLite index");
-}
+const records = readInstallRecords(cfg.plugins?.installs);
+const codexRecord = records.codex || inspect.install;
 if (!codexRecord) {
   throw new Error(`missing codex install record: ${JSON.stringify(records)}`);
 }
 if (codexRecord.source !== "npm") {
   throw new Error(`expected npm codex install record, got ${codexRecord.source}`);
 }
-if (!codexRecord.spec?.includes("@openclaw/codex")) {
+if (!String(codexRecord.spec || "").includes("@openclaw/codex")) {
   throw new Error(`expected @openclaw/codex install spec, got ${codexRecord.spec}`);
 }
 
 const npmRoot = managedNpmRoot();
-const installPath = (codexRecord.installPath || "").replace(/^~(?=$|\/)/u, process.env.HOME);
+const installPath = String(codexRecord.installPath || "").replace(/^~(?=$|\/)/u, process.env.HOME);
 if (!installPath) {
   throw new Error(`missing codex installPath: ${JSON.stringify(codexRecord)}`);
 }
@@ -64,12 +53,7 @@ const openAiCodexPackageJson = findPackageJson("@openai/codex", [
 if (!openAiCodexPackageJson) {
   throw new Error("missing @openai/codex dependency under managed npm root");
 }
-assertCodexReleasePackageContract({
-  pluginPackageJson: codexPackageJson,
-  codexPackageJson: openAiCodexPackageJson,
-  packageRoots: [installPath, npmProjectRoot, npmRoot],
-  managedRoot: npmRoot,
-});
+assertPathInside(npmRoot, openAiCodexPackageJson, "@openai/codex dependency");
 
 const list = readJson("/tmp/openclaw-plugins-list.json");
 const plugin = (list.plugins || []).find((entry) => entry.id === "codex");
@@ -92,17 +76,32 @@ if (!hasHarness) {
 }
 
 const primaryModel = cfg.agents?.defaults?.model?.primary;
-if (primaryModel !== "openai/gpt-5.6-sol") {
-  throw new Error(`expected OpenAI onboarding model openai/gpt-5.6-sol, got ${primaryModel}`);
+if (primaryModel !== "openai/gpt-5.5") {
+  throw new Error(`expected OpenAI onboarding model openai/gpt-5.5, got ${primaryModel}`);
 }
 const providerRuntime = cfg.models?.providers?.openai?.agentRuntime?.id;
 if (providerRuntime && providerRuntime !== "codex") {
   throw new Error(`unexpected OpenAI provider runtime: ${providerRuntime}`);
 }
 
-const openClawStateDir = stateDir();
-assertNoLegacyPrimaryAuthRows(openClawStateDir);
-const authRaw = readCanonicalAuthProfileStoreText(openClawStateDir);
+function readAuthProfileStoreText(agentDir) {
+  const dbPath = path.join(agentDir, "openclaw-agent.sqlite");
+  if (!fs.existsSync(dbPath)) {
+    throw new Error("auth profile SQLite store was not persisted");
+  }
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db
+      .prepare("SELECT store_json FROM auth_profile_store WHERE store_key = ?")
+      .get("primary");
+    return typeof row?.store_json === "string" ? row.store_json : "";
+  } finally {
+    db?.close();
+  }
+}
+
+const authRaw = readAuthProfileStoreText(path.join(stateDir(), "agents", "main", "agent"));
 if (!authRaw) {
   throw new Error("auth profile SQLite store row was not persisted");
 }
