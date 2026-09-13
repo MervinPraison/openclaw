@@ -13,8 +13,6 @@ run_plugins_clawhub_scenario() {
       local server_port_file="$fixture_dir/clawhub-fixture-port"
       local server_pid_file="$fixture_dir/clawhub-fixture-pid"
 
-      openclaw_plugins_validate_fixture_log_print_bytes || return $?
-
       node scripts/e2e/lib/clawhub-fixture-server.cjs plugins "$server_port_file" >"$server_log" 2>&1 &
       local server_pid="$!"
       echo "$server_pid" >"$server_pid_file"
@@ -47,16 +45,12 @@ run_plugins_clawhub_scenario() {
       fi
       unset OPENCLAW_CLAWHUB_URL CLAWHUB_URL
       clawhub_fixture_dir="$(mktemp -d "$OPENCLAW_PLUGINS_TMP_DIR/openclaw-clawhub-fixture.XXXXXX")"
-      local fixture_status=0
-      start_clawhub_fixture_server "$clawhub_fixture_dir" || fixture_status="$?"
-      if [[ "$fixture_status" -ne 0 ]]; then
-        return "$fixture_status"
-      fi
+      start_clawhub_fixture_server "$clawhub_fixture_dir" || return 1
     fi
 
     node scripts/e2e/lib/plugins/assertions.mjs clawhub-preflight
 
-    run_plugins_fixture_logged install-clawhub plugins install "$CLAWHUB_PLUGIN_SPEC"
+    run_plugins_openclaw_logged install-clawhub plugins install "$CLAWHUB_PLUGIN_SPEC"
     run_plugins_openclaw_capture "$OPENCLAW_PLUGINS_TMP_DIR/plugins-clawhub-installed.json" plugins list --json
     run_plugins_openclaw_capture "$OPENCLAW_PLUGINS_TMP_DIR/plugins-clawhub-inspect.json" plugins inspect "$CLAWHUB_PLUGIN_ID" --json
 

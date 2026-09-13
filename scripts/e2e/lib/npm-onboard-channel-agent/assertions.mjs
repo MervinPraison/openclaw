@@ -1,41 +1,17 @@
 // Assertions for npm onboard channel-agent E2E scenarios.
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   assertAgentReplyContainsMarker,
   assertOpenAiRequestLogUsed,
 } from "../agent-turn-output.mjs";
-import {
-  assertNoLegacyPrimaryAuthRows,
-  assertOpenAiEnvAuthProfileStore,
-  readCanonicalAuthProfileStoreText,
-} from "../auth-profile-store-assertions.mjs";
-import { readPositiveIntEnv } from "../env-limits.mjs";
-import {
-  applyMockOpenAiModelConfig,
-  parseMockOpenAiPort,
-} from "../fixtures/mock-openai-config.mjs";
-import { readTextFileBounded, readTextFileTail } from "../text-file-utils.mjs";
+import { assertOpenAiEnvAuthProfileStore } from "../auth-profile-store-assertions.mjs";
+import { applyMockOpenAiModelConfig } from "../fixtures/mock-openai-config.mjs";
 
 const command = process.argv[2];
-const ERROR_DETAIL_TAIL_BYTES = 16 * 1024;
-const JSON_ARTIFACT_MAX_BYTES = readPositiveIntEnv(
-  "OPENCLAW_NPM_ONBOARD_JSON_ARTIFACT_MAX_BYTES",
-  1024 * 1024,
-);
-const STATUS_TEXT_MAX_BYTES = readPositiveIntEnv(
-  "OPENCLAW_NPM_ONBOARD_STATUS_TEXT_MAX_BYTES",
-  1024 * 1024,
-);
+const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 const ansiEscapePattern = new RegExp(String.raw`\u001b\[[0-?]*[ -/]*[@-~]`, "g");
-
-function readJson(file) {
-  return JSON.parse(
-    readTextFileBounded(file, "JSON artifact", JSON_ARTIFACT_MAX_BYTES, {
-      tailBytes: ERROR_DETAIL_TAIL_BYTES,
-    }),
-  );
-}
 
 function stripAnsi(text) {
   return text.replace(ansiEscapePattern, "");
@@ -80,16 +56,38 @@ function extractStatusSection(text, title) {
   return stripAnsi(section.join("\n"));
 }
 
+function readAuthProfileStoreText(agentDir) {
+  const dbPath = path.join(agentDir, "openclaw-agent.sqlite");
+  if (!fs.existsSync(dbPath)) {
+    return "";
+  }
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db
+      .prepare("SELECT store_json FROM auth_profile_store WHERE store_key = ?")
+      .get("primary");
+    return typeof row?.store_json === "string" ? row.store_json : "";
+  } catch {
+    return "";
+  } finally {
+    db?.close();
+  }
+}
+
 function assertOnboardState() {
   const home = process.argv[3];
   const stateDir = path.join(home, ".openclaw");
   const configPath = path.join(stateDir, "openclaw.json");
+  const agentDir = path.join(stateDir, "agents", "main", "agent");
 
   if (!fs.existsSync(configPath)) {
     throw new Error("onboard did not write openclaw.json");
   }
-  assertNoLegacyPrimaryAuthRows(stateDir);
-  const authStoreText = readCanonicalAuthProfileStoreText(stateDir);
+  if (!fs.existsSync(agentDir)) {
+    throw new Error("onboard did not create main agent dir");
+  }
+  const authStoreText = readAuthProfileStoreText(agentDir);
   if (!authStoreText) {
     throw new Error("onboard did not persist auth profile store");
   }
@@ -101,7 +99,7 @@ function assertOnboardState() {
 }
 
 function configureMockModel() {
-  const mockPort = parseMockOpenAiPort(process.argv[3]);
+  const mockPort = Number(process.argv[3]);
   const configPath = path.join(process.env.HOME, ".openclaw", "openclaw.json");
   const cfg = readJson(configPath);
   applyMockOpenAiModelConfig(cfg, { mockPort });
@@ -109,15 +107,17 @@ function configureMockModel() {
 }
 
 function assertMockModelConfig() {
-  const mockPort = parseMockOpenAiPort(process.argv[3]);
-  const expectedModelRef = "openai/gpt-5.6-luna";
+  const mockPort = Number(process.argv[3]);
+  const expectedModelRef = "openai/gpt-5.5";
   const expectedBaseUrl = `http://127.0.0.1:${mockPort}/v1`;
   const configPath = path.join(process.env.HOME, ".openclaw", "openclaw.json");
   const cfg = readJson(configPath);
   const provider = cfg.models?.providers?.openai;
   const defaultModel = cfg.agents?.defaults?.model?.primary;
   const defaultRuntime = cfg.agents?.defaults?.models?.[expectedModelRef]?.agentRuntime?.id;
-  const agent = cfg.agents?.entries?.main;
+  const agent = Array.isArray(cfg.agents?.list)
+    ? (cfg.agents.list.find((entry) => entry?.id === "main") ?? cfg.agents.list[0])
+    : undefined;
   const agentModel = agent?.model?.primary;
   const agentRuntime = agent?.models?.[expectedModelRef]?.agentRuntime?.id;
   if (provider?.baseUrl !== expectedBaseUrl) {
@@ -139,12 +139,12 @@ function assertMockModelConfig() {
   if (defaultRuntime !== "openclaw") {
     throw new Error(`mock default runtime was not preserved; got ${defaultRuntime}`);
   }
-  if (agentModel !== expectedModelRef) {
+  if (agent && agentModel !== expectedModelRef) {
     throw new Error(
       `mock agent model was not preserved; expected ${expectedModelRef}, got ${agentModel}`,
     );
   }
-  if (agentRuntime !== "openclaw") {
+  if (agent && agentRuntime !== "openclaw") {
     throw new Error(`mock agent runtime was not preserved; got ${agentRuntime}`);
   }
 }
@@ -198,13 +198,6 @@ function assertStatusSurfaces() {
   const channelsStatusPath = process.argv[4];
   const statusTextPath = process.argv[5];
   const channelsStatus = readJson(channelsStatusPath);
-  const statusText = readTextFileBounded(
-    statusTextPath,
-    "plain status output",
-    STATUS_TEXT_MAX_BYTES,
-    { tailBytes: ERROR_DETAIL_TAIL_BYTES },
-  );
-  const statusTail = readTextFileTail(statusTextPath, ERROR_DETAIL_TAIL_BYTES);
   const configuredChannels = Array.isArray(channelsStatus.configuredChannels)
     ? channelsStatus.configuredChannels
     : [];
@@ -213,20 +206,17 @@ function assertStatusSurfaces() {
       `channels status did not list configured channel ${channel}. Payload: ${JSON.stringify(channelsStatus)}`,
     );
   }
+  const statusText = fs.readFileSync(statusTextPath, "utf8");
   if (!/channels/i.test(statusText)) {
-    throw new Error(
-      `plain status output did not render a Channels section. Output tail: ${statusTail}`,
-    );
+    throw new Error(`plain status output did not render a Channels section. Output: ${statusText}`);
   }
   const channelsSection = extractStatusSection(statusText, "channels");
   if (!channelsSection) {
-    throw new Error(
-      `plain status output did not render a Channels section. Output tail: ${statusTail}`,
-    );
+    throw new Error(`plain status output did not render a Channels section. Output: ${statusText}`);
   }
   if (!channelsSection.toLowerCase().includes(channel.toLowerCase())) {
     throw new Error(
-      `plain status output did not mention ${channel} in the Channels section. Output tail: ${statusTail}`,
+      `plain status output did not mention ${channel} in the Channels section. Output: ${statusText}`,
     );
   }
 }

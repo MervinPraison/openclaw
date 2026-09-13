@@ -1,26 +1,11 @@
 #!/usr/bin/env bash
-# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
-if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
-  exec /bin/bash "$0" "$@"
-fi
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT_DIR/scripts/lib/docker-e2e-image.sh"
-source "$ROOT_DIR/scripts/lib/frozen-target-compat.sh"
-
-TARGET_ROOT_DIR="$(cd "${OPENCLAW_DOCKER_E2E_REPO_ROOT:-$ROOT_DIR}" && pwd)"
-KITCHEN_SINK_ASSERTIONS="$(openclaw_resolve_frozen_target_file "$TARGET_ROOT_DIR" \
-  scripts/e2e/lib/kitchen-sink-plugin/assertions.mjs \
-  "$ROOT_DIR/scripts/e2e/lib/kitchen-sink-plugin/assertions.mjs")"
 IMAGE_NAME="$(docker_e2e_resolve_image "openclaw-kitchen-sink-plugin-e2e" OPENCLAW_KITCHEN_SINK_PLUGIN_E2E_IMAGE)"
-OPENCLAW_DOCKER_E2E_LOG_PRINT_BYTES="$(
-  docker_e2e_read_positive_int_env OPENCLAW_DOCKER_E2E_LOG_PRINT_BYTES 65536
-)"
-CLAW_HUB_FIXTURE_WAIT_ATTEMPTS="$(
-  docker_e2e_read_positive_int_env OPENCLAW_CLAWHUB_FIXTURE_WAIT_ATTEMPTS 600
-)"
 
+docker_e2e_build_or_reuse "$IMAGE_NAME" kitchen-sink-plugin
 OPENCLAW_TEST_STATE_SCRIPT_B64="$(docker_e2e_test_state_shell_b64 kitchen-sink-plugin empty)"
 KITCHEN_SINK_NPM_SPEC="${OPENCLAW_KITCHEN_SINK_NPM_SPEC:-npm:@openclaw/kitchen-sink@latest}"
 KITCHEN_SINK_NPM_MISSING_SPEC="${OPENCLAW_KITCHEN_SINK_NPM_MISSING_SPEC:-npm:@openclaw/kitchen-sink@beta}"
@@ -37,14 +22,8 @@ npm-to-clawhub|clawhub:@openclaw/kitchen-sink@latest|openclaw-kitchen-sink-fixtu
 SCENARIOS
 )"
 KITCHEN_SINK_SCENARIOS="${OPENCLAW_KITCHEN_SINK_PLUGIN_SCENARIOS:-$DEFAULT_KITCHEN_SINK_SCENARIOS}"
-MAX_MEMORY_MIB="$(
-  if [[ -n "${OPENCLAW_KITCHEN_SINK_PLUGIN_MAX_MEMORY_MIB:-}" ]]; then
-    docker_e2e_read_nonnegative_decimal_env OPENCLAW_KITCHEN_SINK_PLUGIN_MAX_MEMORY_MIB 2304
-  else
-    docker_e2e_read_nonnegative_decimal_env OPENCLAW_KITCHEN_SINK_MAX_MEMORY_MIB 2304
-  fi
-)"
-MAX_CPU_PERCENT="$(docker_e2e_read_nonnegative_decimal_env OPENCLAW_KITCHEN_SINK_MAX_CPU_PERCENT 1200)"
+MAX_MEMORY_MIB="${OPENCLAW_KITCHEN_SINK_PLUGIN_MAX_MEMORY_MIB:-${OPENCLAW_KITCHEN_SINK_MAX_MEMORY_MIB:-2304}}"
+MAX_CPU_PERCENT="${OPENCLAW_KITCHEN_SINK_MAX_CPU_PERCENT:-1200}"
 DOCKER_RUN_TIMEOUT="${OPENCLAW_KITCHEN_SINK_PLUGIN_DOCKER_RUN_TIMEOUT:-1200s}"
 KITCHEN_SINK_CLI_TIMEOUT="${OPENCLAW_KITCHEN_SINK_PLUGIN_CLI_TIMEOUT:-${KITCHEN_SINK_CLI_TIMEOUT:-180s}}"
 CONTAINER_NAME="openclaw-kitchen-sink-plugin-e2e-$$"
@@ -57,26 +36,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker_e2e_build_or_reuse "$IMAGE_NAME" kitchen-sink-plugin
-
 DOCKER_ENV_ARGS=(
   -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-  -e "OPENCLAW_CLAWHUB_FIXTURE_WAIT_ATTEMPTS=$CLAW_HUB_FIXTURE_WAIT_ATTEMPTS"
-  -e "OPENCLAW_DOCKER_E2E_LOG_PRINT_BYTES=$OPENCLAW_DOCKER_E2E_LOG_PRINT_BYTES"
   -e "OPENCLAW_TEST_STATE_SCRIPT_B64=$OPENCLAW_TEST_STATE_SCRIPT_B64"
   -e "KITCHEN_SINK_SCENARIOS=$KITCHEN_SINK_SCENARIOS"
   -e "KITCHEN_SINK_CLI_TIMEOUT=$KITCHEN_SINK_CLI_TIMEOUT"
 )
-capability_status=0
-openclaw_resolve_frozen_plugin_harness_capabilities \
-  "${OPENCLAW_DOCKER_E2E_REPO_ROOT:-$ROOT_DIR}" || capability_status=$?
-[ "$capability_status" -eq 0 ] || exit "$capability_status"
-openclaw_append_frozen_plugin_harness_docker_env
 if [[ "${OPENCLAW_KITCHEN_SINK_LIVE_CLAWHUB:-0}" = "1" ]]; then
   for env_name in \
     OPENCLAW_KITCHEN_SINK_LIVE_CLAWHUB \
     OPENCLAW_CLAWHUB_URL \
     CLAWHUB_URL \
+    OPENCLAW_CLAWHUB_TOKEN \
     CLAWHUB_TOKEN \
     CLAWHUB_AUTH_TOKEN; do
     env_value="${!env_name:-}"
@@ -89,7 +60,7 @@ fi
 echo "Running kitchen-sink plugin Docker E2E..."
 docker_e2e_docker_cmd rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker_e2e_harness_mount_args
-DOCKER_COMMAND_TIMEOUT="$DOCKER_RUN_TIMEOUT" docker_e2e_docker_run_cmd run --name "$CONTAINER_NAME" "${DOCKER_E2E_HARNESS_ARGS[@]}" "${DOCKER_ENV_ARGS[@]}" -v "$KITCHEN_SINK_ASSERTIONS:/app/scripts/e2e/lib/kitchen-sink-plugin/assertions.mjs:ro" -i "$IMAGE_NAME" bash scripts/e2e/lib/kitchen-sink-plugin/sweep.sh \
+DOCKER_COMMAND_TIMEOUT="$DOCKER_RUN_TIMEOUT" docker_e2e_docker_run_cmd run --name "$CONTAINER_NAME" "${DOCKER_E2E_HARNESS_ARGS[@]}" "${DOCKER_ENV_ARGS[@]}" -i "$IMAGE_NAME" bash scripts/e2e/lib/kitchen-sink-plugin/sweep.sh \
   >"$RUN_LOG" 2>&1 &
 docker_pid="$!"
 

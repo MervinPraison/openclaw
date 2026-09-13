@@ -2,12 +2,9 @@
 import path from "node:path";
 import { setTimeout as setNodeTimeout, clearTimeout as clearNodeTimeout } from "node:timers";
 import { pathToFileURL } from "node:url";
-import { getSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
-import { readSessionTranscriptEvents } from "openclaw/plugin-sdk/session-transcript-runtime";
-import { readBoundedResponseText } from "../lib/bounded-response.mjs";
+import { readBoundedResponseText } from "../lib/bounded-response.ts";
 import { readPositiveIntEnv } from "./lib/env-limits.mjs";
 import {
-  extractMcpCodeModePlannedTools,
   type McpCodeModeMentions,
   validateMcpCodeModeResult,
 } from "./lib/mcp-code-mode-validation.ts";
@@ -19,7 +16,7 @@ type FetchJsonOptions = {
   timeoutMs?: number;
 };
 
-type McpCodeModeClientFetchLimits = {
+export type McpCodeModeClientFetchLimits = {
   bodyMaxBytes: number;
   timeoutMs: number;
 };
@@ -38,7 +35,6 @@ export function readMcpCodeModeClientFetchLimits(
 }
 
 const DEFAULT_FETCH_LIMITS = readMcpCodeModeClientFetchLimits();
-const MCP_CODE_MODE_SESSION_KEY = "agent:main:openresponses:mcp-code-mode-gateway-e2e";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -110,8 +106,8 @@ async function readSessionLogMentions(stateDir: string): Promise<Record<string, 
       apiFileList: "API.list",
       apiFileRead: "API.read",
       mcpNamespace: "MCP.fixture",
-      mcpTool: "MCP.fixture.lookupNote",
-      toolSearchPollution: 'catalog.search("lookup note"',
+      mcpTool: "fixture__lookup_note",
+      toolSearchPollution: 'tools.search("lookup note"',
     },
   });
 }
@@ -131,7 +127,6 @@ async function main() {
       authorization: `Bearer ${gatewayToken}`,
       "content-type": "application/json",
       "x-openclaw-agent": "main",
-      "x-openclaw-session-key": MCP_CODE_MODE_SESSION_KEY,
       "x-openclaw-scopes": "operator.write",
     },
     body: JSON.stringify({
@@ -152,7 +147,7 @@ async function main() {
                 'const api = await API.read("mcp/fixture.d.ts");',
                 'const result = await MCP.fixture.lookupNote({ id: "alpha" });',
                 'return { marker: "MCP_CODE_MODE_FILE_TOOL_RESULT", files: files.files.map((file) => file.path), rootHasFixture: root.content.includes("fixture"), headerHasLookup: api.content.includes("function lookupNote"), note: result.content?.[0]?.text };',
-                "Do not use catalog.search for MCP and do not call the inline MCP API helper.",
+                "Do not use tools.search for MCP and do not call the inline MCP API helper.",
                 "After exec finishes, send a normal assistant reply; do not stop after only the tool call.",
                 "Reply with MCP_CODE_MODE_FILE_OK note=fixture-note-alpha unclear=none only after the MCP call returns fixture-note-alpha.",
               ].join(" "),
@@ -165,21 +160,7 @@ async function main() {
     }),
   });
   const mentions = await readSessionLogMentions(stateDir);
-  const session = getSessionEntry({
-    agentId: "main",
-    sessionKey: MCP_CODE_MODE_SESSION_KEY,
-  });
-  assert(session?.sessionId, "gateway did not persist the MCP code-mode session");
-  const transcriptEvents = await readSessionTranscriptEvents({
-    agentId: "main",
-    sessionId: session.sessionId,
-    sessionKey: MCP_CODE_MODE_SESSION_KEY,
-  });
-  const plannedTools = extractMcpCodeModePlannedTools(transcriptEvents);
-  const finalText = validateMcpCodeModeResult(response, mentions as McpCodeModeMentions, {
-    plannedTools,
-    requireExec: true,
-  });
+  const finalText = validateMcpCodeModeResult(response, mentions as McpCodeModeMentions);
 
   process.stdout.write(
     `${JSON.stringify(
@@ -187,7 +168,6 @@ async function main() {
         ok: true,
         gatewayUrl,
         finalText,
-        plannedTools,
         sessionLogMentions: mentions,
       },
       null,

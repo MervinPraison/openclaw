@@ -1,40 +1,60 @@
 // Plugin Npm Release script supports OpenClaw repository automation.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { expectDefined } from "../../packages/normalization-core/src/expect.js";
-import { isRecord } from "../../packages/normalization-core/src/record-coerce.js";
-import { runTasksWithConcurrency } from "../../src/utils/run-with-concurrency.js";
-import { resolveNpmJsonString } from "./npm-json-output.mts";
-import { fetchNpmRegistryPackumentWithRetry } from "./npm-publish-plan.mjs";
-import {
-  collectExtensionPackageJsonCandidates,
-  hasPluginNpmReleaseAuthorityChanges,
-  PLUGIN_NPM_RELEASE_AUTHORITY_PATHS,
-} from "./plugin-publication-candidates.ts";
-import {
-  assertUniquePublishablePluginPackageSources,
-  collectPublishablePluginPackagesFromCandidates,
-  type PluginPackageJson,
-  type PublishablePluginPackage,
-  type PublishablePluginPackageFilters,
-} from "./plugin-publication-collector.ts";
-import { collectReleaseVersionFloorErrors } from "./release-version.mjs";
+import { normalizeOptionalString } from "../../packages/normalization-core/src/string-coerce.js";
+import { validateExternalCodePluginPackageJson } from "../../packages/plugin-package-contract/src/index.ts";
+import { parseReleaseVersion } from "../openclaw-npm-release-check.ts";
+import { collectReleaseVersionFloorErrors, resolveNpmPublishPlan } from "./npm-publish-plan.mjs";
 
-export {
-  collectPublishablePluginPackageErrors,
-  OPENCLAW_PLUGIN_NPM_REPOSITORY_URL,
-} from "./plugin-publication-collector.ts";
-export type { PublishablePluginPackage } from "./plugin-publication-collector.ts";
+export type PluginPackageJson = {
+  name?: string;
+  version?: string;
+  private?: boolean;
+  repository?:
+    | string
+    | {
+        type?: string;
+        url?: string;
+      };
+  openclaw?: {
+    extensions?: string[];
+    install?: {
+      defaultChoice?: string;
+      minHostVersion?: string;
+      npmSpec?: string;
+    };
+    compat?: {
+      pluginApi?: string;
+      minGatewayVersion?: string;
+    };
+    build?: {
+      openclawVersion?: string;
+      pluginSdkVersion?: string;
+    };
+    release?: {
+      publishToNpm?: boolean;
+    };
+  };
+};
 
-type PluginReleasePlanItem = PublishablePluginPackage & {
+export type PublishablePluginPackage = {
+  extensionId: string;
+  packageDir: string;
+  packageName: string;
+  version: string;
+  channel: "stable" | "alpha" | "beta";
+  publishTag: "latest" | "alpha" | "beta";
+  installNpmSpec?: string;
+};
+
+export type PluginReleasePlanItem = PublishablePluginPackage & {
   alreadyPublished: boolean;
 };
 
-type PluginReleasePlan = {
+export type PluginReleasePlan = {
   all: PluginReleasePlanItem[];
-  warnings: string[];
   candidates: PluginReleasePlanItem[];
   skippedPublished: PluginReleasePlanItem[];
 };
@@ -46,12 +66,7 @@ export type GitRangeSelection = {
   headRef: string;
 };
 
-type PluginNpmGitRangeSelection = {
-  authorityChanged: boolean;
-  changedExtensionIds: string[];
-};
-
-type ParsedPluginReleaseArgs = {
+export type ParsedPluginReleaseArgs = {
   selection: string[];
   selectionMode?: PluginReleaseSelectionMode;
   pluginsFlagProvided: boolean;
@@ -59,26 +74,61 @@ type ParsedPluginReleaseArgs = {
   headRef?: string;
 };
 
-type ParsedPluginNpmReleaseArgs = ParsedPluginReleaseArgs & {
-  npmDistTag?: "extended-stable";
+export type PublishablePluginPackageCandidate<
+  TPackageJson extends PluginPackageJson = PluginPackageJson,
+> = {
+  extensionId: string;
+  packageDir: string;
+  packageJson: TPackageJson;
 };
 
-function parsePluginNpmDistTagOverride(value: string | undefined): "extended-stable" | undefined {
-  if (value === undefined || value.trim() === "") {
-    return undefined;
-  }
-  if (value === "extended-stable") {
-    return value;
-  }
-  throw new Error(`Unknown npm dist-tag override: ${value}. Expected "extended-stable".`);
-}
-
-const PLUGIN_NPM_VIEW_TIMEOUT_MS = 60_000;
-// Match ClawHub's bounded registry fanout without serial npm process startup for every package.
-const PLUGIN_NPM_RELEASE_PLAN_CONCURRENCY = 8;
+export const OPENCLAW_PLUGIN_NPM_REPOSITORY_URL = "https://github.com/openclaw/openclaw";
 
 function readPluginPackageJson(path: string): unknown {
   return JSON.parse(readFileSync(path, "utf8"));
+}
+
+export function collectExtensionPackageJsonCandidates<
+  TPackageJson extends PluginPackageJson = PluginPackageJson,
+>(rootDir = resolve(".")): PublishablePluginPackageCandidate<TPackageJson>[] {
+  const extensionsDir = join(rootDir, "extensions");
+  const dirs = readdirSync(extensionsDir, { withFileTypes: true }).filter((entry) =>
+    entry.isDirectory(),
+  );
+
+  const candidates: PublishablePluginPackageCandidate<TPackageJson>[] = [];
+  for (const dir of dirs) {
+    const packageDir = `extensions/${dir.name}`;
+    const absolutePackageDir = join(extensionsDir, dir.name);
+    const packageJsonPath = join(absolutePackageDir, "package.json");
+    try {
+      candidates.push({
+        extensionId: dir.name,
+        packageDir,
+        packageJson: readPluginPackageJson(packageJsonPath) as TPackageJson,
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return candidates;
+}
+
+export function resolvePublishablePluginVersion(params: {
+  extensionId: string;
+  packageJson: Pick<PluginPackageJson, "version">;
+  validationErrors: string[];
+}): { version: string; parsedVersion: NonNullable<ReturnType<typeof parseReleaseVersion>> } | null {
+  const version = params.packageJson.version?.trim() ?? "";
+  const parsedVersion = parseReleaseVersion(version);
+  if (parsedVersion === null) {
+    params.validationErrors.push(
+      `${params.extensionId}: package.json version must match YYYY.M.PATCH, YYYY.M.PATCH-N, YYYY.M.PATCH-alpha.N, or YYYY.M.PATCH-beta.N; found "${version}".`,
+    );
+    return null;
+  }
+  return { version, parsedVersion };
 }
 
 function normalizeGitDiffPath(path: string): string {
@@ -120,28 +170,28 @@ export function parsePluginReleaseArgs(argv: string[]): ParsedPluginReleaseArgs 
   let headRef: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
-    const arg = expectDefined(argv[index], `plugin release argument at index ${index}`);
+    const arg = argv[index];
     if (arg === "--") {
       continue;
     }
     if (arg === "--plugins") {
-      selection = parsePluginReleaseSelection(readRequiredArgValue(argv, index, arg, true));
+      selection = parsePluginReleaseSelection(argv[index + 1]);
       pluginsFlagProvided = true;
       index += 1;
       continue;
     }
     if (arg === "--selection-mode") {
-      selectionMode = parsePluginReleaseSelectionMode(readRequiredArgValue(argv, index, arg));
+      selectionMode = parsePluginReleaseSelectionMode(argv[index + 1]);
       index += 1;
       continue;
     }
     if (arg === "--base-ref") {
-      baseRef = readRequiredArgValue(argv, index, arg);
+      baseRef = argv[index + 1];
       index += 1;
       continue;
     }
     if (arg === "--head-ref") {
-      headRef = readRequiredArgValue(argv, index, arg);
+      headRef = argv[index + 1];
       index += 1;
       continue;
     }
@@ -166,70 +216,129 @@ export function parsePluginReleaseArgs(argv: string[]): ParsedPluginReleaseArgs 
   if ((baseRef && !headRef) || (!baseRef && headRef)) {
     throw new Error("Both --base-ref and --head-ref are required together.");
   }
+
   return { selection, selectionMode, pluginsFlagProvided, baseRef, headRef };
 }
 
-export function parsePluginNpmReleaseArgs(argv: string[]): ParsedPluginNpmReleaseArgs {
-  const baseArgs: string[] = [];
-  let npmDistTag: "extended-stable" | undefined;
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = expectDefined(argv[index], `plugin npm release argument at index ${index}`);
-    if (arg !== "--npm-dist-tag") {
-      baseArgs.push(arg);
-      continue;
-    }
-    if (npmDistTag !== undefined) {
-      throw new Error("--npm-dist-tag must not be provided more than once.");
-    }
-    npmDistTag = parsePluginNpmDistTagOverride(readRequiredArgValue(argv, index, arg));
-    index += 1;
-  }
-  const parsed = parsePluginReleaseArgs(baseArgs);
-  if (npmDistTag === "extended-stable" && parsed.selectionMode !== "all-publishable") {
-    throw new Error(
-      "extended-stable requires --selection-mode all-publishable without an explicit plugin list.",
+export function collectPublishablePluginPackageErrors(
+  candidate: PublishablePluginPackageCandidate,
+): string[] {
+  const { packageJson } = candidate;
+  const errors: string[] = [];
+  const packageName = packageJson.name?.trim() ?? "";
+  const packageVersion = packageJson.version?.trim() ?? "";
+  const installNpmSpec = normalizeOptionalString(packageJson.openclaw?.install?.npmSpec);
+  const repositoryUrl =
+    typeof packageJson.repository === "string"
+      ? packageJson.repository.trim()
+      : (packageJson.repository?.url?.trim() ?? "");
+  const extensions = packageJson.openclaw?.extensions ?? [];
+
+  if (!packageName.startsWith("@openclaw/")) {
+    errors.push(
+      `package name must start with "@openclaw/"; found "${packageName || "<missing>"}".`,
     );
   }
-  return { ...parsed, npmDistTag };
+  if (packageJson.private === true) {
+    errors.push("package.json private must not be true.");
+  }
+  if (repositoryUrl !== OPENCLAW_PLUGIN_NPM_REPOSITORY_URL) {
+    errors.push(
+      `package.json repository.url must be "${OPENCLAW_PLUGIN_NPM_REPOSITORY_URL}" so npm provenance can validate GitHub trusted publishing; found "${repositoryUrl || "<missing>"}".`,
+    );
+  }
+  if (!packageVersion) {
+    errors.push("package.json version must be non-empty.");
+  } else if (parseReleaseVersion(packageVersion) === null) {
+    errors.push(
+      `package.json version must match YYYY.M.PATCH, YYYY.M.PATCH-N, YYYY.M.PATCH-alpha.N, or YYYY.M.PATCH-beta.N; found "${packageVersion}".`,
+    );
+  }
+  if (!Array.isArray(extensions) || extensions.length === 0) {
+    errors.push("openclaw.extensions must contain at least one entry.");
+  }
+  if (extensions.some((entry) => typeof entry !== "string" || !entry.trim())) {
+    errors.push("openclaw.extensions must contain only non-empty strings.");
+  }
+  if (!installNpmSpec) {
+    errors.push("openclaw.install.npmSpec must be a non-empty string for publishable plugins.");
+  }
+  errors.push(
+    ...validateExternalCodePluginPackageJson(packageJson).issues.map((issue) => issue.message),
+  );
+
+  return errors;
 }
 
-function readRequiredArgValue(
-  argv: string[],
-  index: number,
-  flag: string,
-  allowBlank = false,
-): string {
-  const value = argv[index + 1];
-  const missingValue =
-    value === undefined || value.startsWith("--") || (!allowBlank && value.trim() === "");
-  if (missingValue) {
-    throw new Error(`${flag} requires a value.`);
-  }
-  return value;
-}
+export type PublishablePluginPackageFilters = {
+  extensionIds?: readonly string[];
+  packageNames?: readonly string[];
+};
 
 export function collectPublishablePluginPackages(
   rootDir = resolve("."),
   filters: PublishablePluginPackageFilters = {},
 ): PublishablePluginPackage[] {
-  const rootVersion =
-    filters.npmDistTag === "extended-stable"
-      ? ((
-          readPluginPackageJson(join(rootDir, "package.json")) as PluginPackageJson
-        ).version?.trim() ?? "")
-      : undefined;
-  return collectPublishablePluginPackagesFromCandidates(
-    collectExtensionPackageJsonCandidates(rootDir),
-    "npm",
-    { ...filters, rootVersion },
-  );
+  const publishable: PublishablePluginPackage[] = [];
+  const validationErrors: string[] = [];
+  const selectedExtensionIds = new Set(filters.extensionIds ?? []);
+  const selectedPackageNames = new Set(filters.packageNames ?? []);
+  const hasSelectedExtensionIds = Array.isArray(filters.extensionIds);
+  const hasSelectedPackageNames = Array.isArray(filters.packageNames);
+
+  for (const candidate of collectExtensionPackageJsonCandidates(rootDir)) {
+    const { extensionId, packageDir, packageJson } = candidate;
+    if (hasSelectedExtensionIds && !selectedExtensionIds.has(extensionId)) {
+      continue;
+    }
+    const packageName = packageJson.name?.trim() ?? "";
+    if (hasSelectedPackageNames && !selectedPackageNames.has(packageName)) {
+      continue;
+    }
+    if (packageJson.openclaw?.release?.publishToNpm !== true) {
+      continue;
+    }
+
+    const errors = collectPublishablePluginPackageErrors(candidate);
+    if (errors.length > 0) {
+      validationErrors.push(...errors.map((error) => `${extensionId}: ${error}`));
+      continue;
+    }
+
+    const resolvedVersion = resolvePublishablePluginVersion({
+      extensionId,
+      packageJson,
+      validationErrors,
+    });
+    if (!resolvedVersion) {
+      continue;
+    }
+    const { version, parsedVersion } = resolvedVersion;
+
+    publishable.push({
+      extensionId,
+      packageDir,
+      packageName,
+      version,
+      channel: parsedVersion.channel,
+      publishTag: resolveNpmPublishPlan(version).publishTag,
+      installNpmSpec: normalizeOptionalString(packageJson.openclaw?.install?.npmSpec),
+    });
+  }
+
+  if (validationErrors.length > 0) {
+    throw new Error(
+      `Publishable plugin metadata validation failed:\n${validationErrors.map((error) => `- ${error}`).join("\n")}`,
+    );
+  }
+
+  return publishable.toSorted((left, right) => left.packageName.localeCompare(right.packageName));
 }
 
 export function resolveSelectedPublishablePluginPackages(params: {
   plugins: PublishablePluginPackage[];
   selection: string[];
 }): PublishablePluginPackage[] {
-  assertUniquePublishablePluginPackageSources(params.plugins, "Plugin selection");
   if (params.selection.length === 0) {
     return params.plugins;
   }
@@ -331,19 +440,17 @@ export function collectChangedPathsFromGitRange(params: {
     .map((path) => normalizeGitDiffPath(path));
 }
 
-export function collectPluginNpmGitRangeSelection(params: {
+export function collectChangedExtensionIdsFromGitRange(params: {
   rootDir?: string;
   gitRange: GitRangeSelection;
-}): PluginNpmGitRangeSelection {
-  const changedPaths = collectChangedPathsFromGitRange({
-    rootDir: params.rootDir,
-    gitRange: params.gitRange,
-    pathspecs: ["extensions", ...PLUGIN_NPM_RELEASE_AUTHORITY_PATHS],
-  });
-  return {
-    authorityChanged: hasPluginNpmReleaseAuthorityChanges(changedPaths),
-    changedExtensionIds: collectChangedExtensionIdsFromPaths(changedPaths),
-  };
+}): string[] {
+  return collectChangedExtensionIdsFromPaths(
+    collectChangedPathsFromGitRange({
+      rootDir: params.rootDir,
+      gitRange: params.gitRange,
+      pathspecs: ["extensions"],
+    }),
+  );
 }
 
 export function resolveChangedPublishablePluginPackages(params: {
@@ -383,135 +490,46 @@ export function assertPluginReleaseVersionFloors(
   );
 }
 
-export type NpmLatestVersionResolver = (packageName: string) => string;
-
-function isNpmViewTimeoutError(error: unknown): error is Error & { code: "ETIMEDOUT" } {
-  return error instanceof Error && "code" in error && error.code === "ETIMEDOUT";
-}
-
-function runNpmView(args: string[]): string {
+function isPluginVersionPublished(packageName: string, version: string): boolean {
   const tempDir = mkdtempSync(join(tmpdir(), "openclaw-plugin-npm-view-"));
   const userconfigPath = join(tempDir, "npmrc");
   writeFileSync(userconfigPath, "");
 
   try {
-    try {
-      return execFileSync("npm", ["view", ...args, "--userconfig", userconfigPath], {
+    execFileSync(
+      "npm",
+      ["view", `${packageName}@${version}`, "version", "--userconfig", userconfigPath],
+      {
         encoding: "utf8",
-        killSignal: "SIGKILL",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: PLUGIN_NPM_VIEW_TIMEOUT_MS,
-      }).trim();
-    } catch (error) {
-      if (isNpmViewTimeoutError(error)) {
-        throw Object.assign(
-          new Error(`npm view timed out after ${PLUGIN_NPM_VIEW_TIMEOUT_MS}ms.`, {
-            cause: error,
-          }),
-          { code: "ETIMEDOUT" as const },
-        );
-      }
-      throw error;
-    }
+      },
+    );
+    return true;
+  } catch {
+    return false;
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
 }
 
-function resolveNpmLatestVersion(packageName: string): string {
-  const raw = runNpmView([packageName, "dist-tags.latest", "--json"]);
-  const version = resolveNpmJsonString(JSON.parse(raw));
-  if (!version) {
-    throw new Error(`npm returned an invalid latest dist-tag for ${packageName}.`);
-  }
-  return version;
-}
-
-export function collectPluginReleaseDependencyFreshnessWarnings(
-  plugins: readonly PublishablePluginPackage[],
-  resolveLatestVersion: NpmLatestVersionResolver = resolveNpmLatestVersion,
-): string[] {
-  // Release validation owns pin compatibility. A moving npm dist-tag must not
-  // invalidate a frozen, tested candidate, including when the lookup is unavailable.
-  const latestVersions = new Map<string, string>();
-  const warnings: string[] = [];
-
-  for (const plugin of plugins) {
-    for (const dependency of plugin.requiredLatestDependencies ?? []) {
-      let latestVersion = latestVersions.get(dependency.packageName);
-      if (!latestVersion) {
-        try {
-          latestVersion = resolveLatestVersion(dependency.packageName);
-          latestVersions.set(dependency.packageName, latestVersion);
-        } catch (error) {
-          warnings.push(
-            `${plugin.packageName}@${plugin.version}: could not resolve npm latest for ${dependency.packageName} (pinned "${dependency.version}"); freshness is advisory: ${error instanceof Error ? error.message : String(error)}`,
-          );
-          continue;
-        }
-      }
-      if (dependency.version !== latestVersion) {
-        warnings.push(
-          `${plugin.packageName}@${plugin.version}: ${dependency.packageName} pinned "${dependency.version}", npm latest is "${latestVersion}". Freshness is advisory; retain the release-validated pin.`,
-        );
-      }
-    }
-  }
-
-  return warnings;
-}
-
-export function assertPluginReleaseDependencyFreshness(
-  plugins: readonly PublishablePluginPackage[],
-  label: string,
-  resolveLatestVersion: NpmLatestVersionResolver = resolveNpmLatestVersion,
-): string[] {
-  const warnings = collectPluginReleaseDependencyFreshnessWarnings(plugins, resolveLatestVersion);
-  for (const warning of warnings) {
-    console.warn(`${label}: warning: ${warning}`);
-  }
-  return warnings;
-}
-
-async function isPluginVersionPublished(packageName: string, version: string): Promise<boolean> {
-  const result = await fetchNpmRegistryPackumentWithRetry({
-    packageName,
-    packageUrl: `https://registry.npmjs.org/${encodeURIComponent(packageName)}`,
-  });
-  if (result.status === 404) {
-    return false;
-  }
-  if (!result.ok) {
-    throw new Error(`${packageName}: npm registry returned HTTP ${result.status}.`);
-  }
-  if (!isRecord(result.packument) || !isRecord(result.packument.versions)) {
-    throw new Error(`${packageName}: npm registry returned an invalid versions map.`);
-  }
-  return Object.hasOwn(result.packument.versions, version);
-}
-
-export async function collectPluginReleasePlan(params?: {
+export function collectPluginReleasePlan(params?: {
   rootDir?: string;
   selection?: string[];
   selectionMode?: PluginReleaseSelectionMode;
   gitRange?: GitRangeSelection;
-  npmDistTag?: "extended-stable";
-}): Promise<PluginReleasePlan> {
-  const gitRangeSelection = params?.gitRange
-    ? collectPluginNpmGitRangeSelection({
+}): PluginReleasePlan {
+  const changedExtensionIds = params?.gitRange
+    ? collectChangedExtensionIdsFromGitRange({
         rootDir: params.rootDir,
         gitRange: params.gitRange,
       })
-    : undefined;
+    : [];
   const allPublishable = collectPublishablePluginPackages(params?.rootDir, {
     extensionIds:
-      params?.selectionMode === "all-publishable" ||
-      !gitRangeSelection ||
-      gitRangeSelection.authorityChanged
+      params?.selectionMode === "all-publishable" || !params?.gitRange
         ? undefined
-        : gitRangeSelection.changedExtensionIds,
+        : changedExtensionIds,
     packageNames: params?.selection && params.selection.length > 0 ? params.selection : undefined,
-    npmDistTag: params?.npmDistTag,
   });
   const selectedPublishable =
     params?.selectionMode === "all-publishable"
@@ -521,13 +539,11 @@ export async function collectPluginReleasePlan(params?: {
             plugins: allPublishable,
             selection: params.selection,
           })
-        : gitRangeSelection
-          ? gitRangeSelection.authorityChanged
-            ? allPublishable
-            : resolveChangedPublishablePluginPackages({
-                plugins: allPublishable,
-                changedExtensionIds: gitRangeSelection.changedExtensionIds,
-              })
+        : params?.gitRange
+          ? resolveChangedPublishablePluginPackages({
+              plugins: allPublishable,
+              changedExtensionIds,
+            })
           : allPublishable;
 
   const explicitPublishSelection =
@@ -535,27 +551,15 @@ export async function collectPluginReleasePlan(params?: {
   if (explicitPublishSelection) {
     assertPluginReleaseVersionFloors(selectedPublishable, "Plugin NPM release plan");
   }
-  const warnings = assertPluginReleaseDependencyFreshness(
-    selectedPublishable,
-    "Plugin NPM release plan",
-  );
 
-  const plan = await runTasksWithConcurrency({
-    tasks: selectedPublishable.map((plugin) => async () => ({
-      ...plugin,
-      alreadyPublished: await isPluginVersionPublished(plugin.packageName, plugin.version),
-    })),
-    limit: PLUGIN_NPM_RELEASE_PLAN_CONCURRENCY,
-    errorMode: "stop",
-  });
-  if (plan.hasError) {
-    throw plan.firstError;
-  }
-  const all = plan.results;
+  const all = selectedPublishable.map((plugin) =>
+    Object.assign({}, plugin, {
+      alreadyPublished: isPluginVersionPublished(plugin.packageName, plugin.version),
+    }),
+  );
 
   return {
     all,
-    warnings,
     candidates: all.filter((plugin) => !plugin.alreadyPublished),
     skippedPublished: all.filter((plugin) => plugin.alreadyPublished),
   };

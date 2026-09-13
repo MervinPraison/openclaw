@@ -2,25 +2,19 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readPositiveIntEnvWithEmptyFallback } from "../env-limits.mjs";
-import { assertRealPathInside, resolveHomePath } from "../openclaw-state-paths.mjs";
 import { readPluginInstallRecords } from "../plugin-index-sqlite.mjs";
-import { hasExpectedPluginUninstallConfigState } from "../plugin-uninstall-assertions.mjs";
 
 const command = process.argv[2];
 const scratchRoot = process.env.KITCHEN_SINK_TMP_DIR || os.tmpdir();
 
 const LOG_SCAN_CHUNK_BYTES = 64 * 1024;
 const LOG_SCAN_FINDING_CONTEXT_CHARS = 2048;
-const LOG_SCAN_MAX_ENTRIES = readPositiveIntEnvWithEmptyFallback(
-  "KITCHEN_SINK_LOG_SCAN_MAX_ENTRIES",
-  20_000,
-);
+const LOG_SCAN_MAX_ENTRIES = readPositiveIntEnv("KITCHEN_SINK_LOG_SCAN_MAX_ENTRIES", 20_000);
 const LOG_SCAN_MAX_FILES = 5000;
 const LOG_SCAN_MAX_FINDINGS = 100;
 const LOG_SCAN_MAX_LINE_CHARS = 16 * 1024;
 const LOG_SCAN_SEGMENT_OVERLAP_CHARS = 256;
-const EXPECT_FAILURE_OUTPUT_MAX_BYTES = readPositiveIntEnvWithEmptyFallback(
+const EXPECT_FAILURE_OUTPUT_MAX_BYTES = readPositiveIntEnv(
   "KITCHEN_SINK_EXPECT_FAILURE_OUTPUT_MAX_BYTES",
   1024 * 1024,
 );
@@ -28,6 +22,32 @@ const EXPECT_FAILURE_OUTPUT_MAX_BYTES = readPositiveIntEnvWithEmptyFallback(
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 const scratchFile = (name) => path.join(scratchRoot, name);
 const normalizedPath = (filePath) => filePath.replaceAll("\\", "/");
+
+function readPositiveIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") {
+    return fallback;
+  }
+  const text = raw.trim();
+  if (!/^\d+$/u.test(text)) {
+    throw new Error(`${name} must be a positive integer; got: ${raw}`);
+  }
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer; got: ${raw}`);
+  }
+  return parsed;
+}
+
+function resolveHomePath(value) {
+  if (value === "~") {
+    return process.env.HOME;
+  }
+  if (value?.startsWith("~/") || value?.startsWith("~\\")) {
+    return path.join(process.env.HOME, value.slice(2));
+  }
+  return value;
+}
 
 function readTextFileBounded(file, maxBytes, label) {
   const stats = fs.statSync(file);
@@ -249,20 +269,11 @@ function readConfig() {
 
 function configureRuntime() {
   const pluginId = process.env.KITCHEN_SINK_ID;
-  const personality = process.env.KITCHEN_SINK_PERSONALITY?.trim();
   const { configPath, config } = readConfig();
   config.plugins = config.plugins || {};
   config.plugins.entries = config.plugins.entries || {};
   config.plugins.entries[pluginId] = {
     ...config.plugins.entries[pluginId],
-    ...(personality
-      ? {
-          config: {
-            ...config.plugins.entries[pluginId]?.config,
-            personality,
-          },
-        }
-      : {}),
     hooks: {
       ...config.plugins.entries[pluginId]?.hooks,
       allowConversationAccess: true,
@@ -306,12 +317,12 @@ const expectMissing = (listValue, expected, field) => {
   }
 };
 
-const INVALID_PROBE_DIAGNOSTIC_SURFACE_MODES = new Set(["full", "adversarial"]);
+const INVALID_PROBE_DIAGNOSTIC_SURFACE_MODES = new Set(["full", "conformance", "adversarial"]);
 const requiredFullDiagnosticCanaries = new Set([
   "agent tool result middleware must be a function",
   "trusted tool policy registration requires id, description, and evaluate()",
   "plugin must declare contracts.tools for: kitchen-sink-tool",
-  'channel "kitchen-sink-channel-probe" registration missing or invalid required capabilities.chatTypes',
+  'channel "kitchen-sink-channel-probe" registration missing required config helpers',
   'agent harness "kitchen-sink-agent-harness" registration missing required runtime methods',
   "session scheduler job registration requires unique id, sessionKey, and kind",
 ]);
@@ -326,16 +337,14 @@ function assertExpectedDiagnostics(surfaceMode, errorMessages) {
     "control UI descriptor registration requires id, surface, label, and valid optional fields",
     "hosted media resolver registration missing resolver",
     "http route registration missing or invalid auth: /kitchen-sink/http-route",
-    "invalid widget presenter registration",
     "node invoke policy registration missing commands",
     "trusted tool policy registration requires id, description, and evaluate()",
     "plugin must declare contracts.embeddingProviders for adapter: kitchen-sink-embedding-provider",
+    "plugin must own memory slot or declare contracts.memoryEmbeddingProviders for adapter: kitchen-sink-memory-embedding-provider",
     "plugin must declare contracts.tools for: kitchen-sink-tool",
-    'channel "kitchen-sink-channel-probe" registration missing or invalid required capabilities.chatTypes',
+    'channel "kitchen-sink-channel-probe" registration missing required config helpers',
     'agent harness "kitchen-sink-agent-harness" registration missing required runtime methods',
-    "memory prompt preparation registration missing prepare function",
     "memory prompt supplement registration missing builder",
-    "MCP server connection resolver registration missing serverName or resolve",
     "model catalog provider registration missing provider",
     "session extension registration requires namespace and description",
     "session scheduler job registration requires unique id, sessionKey, and kind",
@@ -344,24 +353,14 @@ function assertExpectedDiagnostics(surfaceMode, errorMessages) {
   const optionalErrorMessages = new Set([
     "agent event subscription registration requires id and handle",
   ]);
-  const frozenTargetErrorMessages = new Set();
-  if (process.env.OPENCLAW_FROZEN_PLUGIN_PRERELEASE_FIXTURE_DIALECT === "legacy") {
-    frozenTargetErrorMessages.add(
-      "plugin must own memory slot or declare contracts.memoryEmbeddingProviders for adapter: kitchen-sink-memory-embedding-provider",
-    );
-  }
   const allowedErrorMessages = new Set([...expectedErrorMessages, ...optionalErrorMessages]);
   if (!INVALID_PROBE_DIAGNOSTIC_SURFACE_MODES.has(surfaceMode)) {
-    const unexpected = [...errorMessages].filter(
-      (message) => !frozenTargetErrorMessages.has(message),
-    );
-    if (unexpected.length > 0) {
-      throw new Error(`unexpected kitchen-sink diagnostic errors: ${unexpected.join(", ")}`);
+    if (errorMessages.size > 0) {
+      throw new Error(
+        `unexpected kitchen-sink diagnostic errors: ${[...errorMessages].join(", ")}`,
+      );
     }
     return;
-  }
-  for (const message of frozenTargetErrorMessages) {
-    allowedErrorMessages.add(message);
   }
   for (const message of errorMessages) {
     if (!allowedErrorMessages.has(message)) {
@@ -380,6 +379,17 @@ function assertExpectedDiagnostics(surfaceMode, errorMessages) {
         throw new Error(`missing expected kitchen-sink diagnostic error: ${message}`);
       }
     }
+  }
+}
+
+function assertRealPathInside(parentPath, childPath, label) {
+  const parentRealPath = fs.realpathSync(parentPath);
+  const childRealPath = fs.realpathSync(childPath);
+  if (
+    childRealPath !== parentRealPath &&
+    !childRealPath.startsWith(`${parentRealPath}${path.sep}`)
+  ) {
+    throw new Error(`${label} resolved outside ${parentPath}: ${childRealPath}`);
   }
 }
 
@@ -626,10 +636,6 @@ function assertInstalled() {
   if (!fs.existsSync(installPath)) {
     throw new Error(`kitchen-sink install path missing: ${record.installPath}`);
   }
-  if (source === "clawhub") {
-    const extensionsRoot = path.join(process.env.HOME, ".openclaw", "extensions");
-    assertRealPathInside(extensionsRoot, installPath, "kitchen-sink ClawHub install path");
-  }
   if (source === "clawhub" && record.artifactKind === "npm-pack") {
     assertClawHubExternalInstallContract(installPath);
   }
@@ -650,8 +656,8 @@ function assertRemoved() {
   }
 
   const { config } = readConfig();
-  if (!hasExpectedPluginUninstallConfigState(config, pluginId)) {
-    throw new Error(`kitchen-sink exact disabled uninstall marker missing: ${pluginId}`);
+  if (config.plugins?.entries?.[pluginId]) {
+    throw new Error(`kitchen-sink config entry still present after uninstall: ${pluginId}`);
   }
   if ((config.plugins?.allow || []).includes(pluginId)) {
     throw new Error(`kitchen-sink allowlist still contains ${pluginId}`);

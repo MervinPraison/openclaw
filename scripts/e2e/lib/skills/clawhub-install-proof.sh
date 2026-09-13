@@ -79,63 +79,32 @@ const [searchPath, resolvePath, requestedSlug, preferredSlug] = process.argv.sli
 const payload = JSON.parse(fs.readFileSync(searchPath, "utf8"));
 const results = Array.isArray(payload) ? payload : Array.isArray(payload.results) ? payload.results : [];
 const slugs = results.map((entry) => String(entry.slug ?? "")).filter(Boolean);
-const hasExplicitRisk = (entry) =>
-  String(entry?.trust?.clawHubVerdict ?? "").toLowerCase() === "suspicious" ||
-  entry?.native?.skill?.isSuspicious === true;
-let candidates;
+let chosen;
 if (requestedSlug) {
-  const requested = results.find((entry) => entry.slug === requestedSlug);
-  if (!requested) {
+  chosen = results.find((entry) => entry.slug === requestedSlug);
+  if (!chosen) {
     throw new Error(`Requested skill slug ${requestedSlug} not found. Search returned: ${slugs.join(", ") || "(none)"}`);
   }
-  candidates = [requested];
 } else {
-  const safeResults = results.filter((entry) => !hasExplicitRisk(entry));
-  const preferred = safeResults.find((entry) => entry.slug === preferredSlug);
-  const homeassistant = safeResults.find((entry) => String(entry.slug ?? "").includes("homeassistant"));
-  candidates = [preferred, homeassistant, ...safeResults]
-    .filter((entry, index, ordered) => entry && ordered.indexOf(entry) === index)
-    .slice(0, 3);
+  chosen =
+    results.find((entry) => entry.slug === preferredSlug) ??
+    results.find((entry) => String(entry.slug ?? "").includes("homeassistant")) ??
+    results[0];
 }
-if (!candidates[0]?.slug) {
-  throw new Error(`No non-suspicious skill slug found. Search returned: ${slugs.join(", ") || "(none)"}`);
+if (!chosen?.slug) {
+  throw new Error(`No installable skill slug found. Search returned: ${slugs.join(", ") || "(none)"}`);
 }
 fs.writeFileSync(resolvePath, `${JSON.stringify({
-  candidates: candidates.map((entry) => ({
-    slug: entry.slug,
-    installRef: entry.installRef ?? entry.slug,
-    version: entry.version ?? null,
-    displayName: entry.displayName ?? entry.name ?? entry.slug,
-  })),
+  slug: chosen.slug,
+  version: chosen.version ?? null,
+  displayName: chosen.displayName ?? chosen.name ?? chosen.slug,
 })}\n`);
 NODE
 
-slug=""
-install_ref=""
-while IFS=$'\t' read -r candidate_slug candidate_install_ref; do
-  echo "Installing live ClawHub skill: $candidate_slug"
-  if "${OPENCLAW_CMD[@]}" skills install "$candidate_install_ref" --force >"$install_log" 2>&1; then
-    slug="$candidate_slug"
-    install_ref="$candidate_install_ref"
-    break
-  fi
-  if [ -z "$requested_slug" ] && \
-    grep -Fq "ClawHub Security Audit" "$install_log" && \
-    grep -Eq "Outcome: .*Blocked" "$install_log"; then
-    echo "Skipping live ClawHub skill with current security findings: $candidate_slug"
-    continue
-  fi
+slug="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).slug)' "$resolve_json")"
+echo "Installing live ClawHub skill: $slug"
+if ! "${OPENCLAW_CMD[@]}" skills install "$slug" --force >"$install_log" 2>&1; then
   echo "Skill install failed" >&2
-  openclaw_e2e_dump_logs /tmp/openclaw-skill-install-npm.log "$search_json" "$resolve_json" "$install_log"
-  exit 1
-done < <(node -e '
-  const payload = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
-  for (const candidate of payload.candidates) {
-    process.stdout.write(`${candidate.slug}\t${candidate.installRef}\n`);
-  }
-' "$resolve_json")
-if [ -z "$slug" ]; then
-  echo "No live ClawHub search candidate passed current security checks" >&2
   openclaw_e2e_dump_logs /tmp/openclaw-skill-install-npm.log "$search_json" "$resolve_json" "$install_log"
   exit 1
 fi
@@ -156,10 +125,6 @@ import fs from "node:fs";
 import path from "node:path";
 const [configPath, skillDir, originPath, lockPath, infoPath, slug] = process.argv.slice(2);
 const read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
-function isPathInside(parentPath, childPath) {
-  const relative = path.relative(path.resolve(parentPath), path.resolve(childPath));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
 const config = read(configPath);
 if (config.skills?.install?.allowUploadedArchives !== false) {
   throw new Error("skills.install.allowUploadedArchives must remain false during ClawHub install proof");
@@ -177,7 +142,7 @@ const infoFilePath = info.filePath ?? info.skill?.filePath;
 const infoBaseDir = info.baseDir ?? info.skill?.baseDir;
 if (
   info.skillKey !== slug &&
-  (!infoFilePath || !isPathInside(skillDir, infoFilePath))
+  (!infoFilePath || !path.resolve(infoFilePath).startsWith(path.resolve(skillDir)))
 ) {
   throw new Error(`skills info did not report installed skill ${slug}: ${JSON.stringify(info)}`);
 }

@@ -14,18 +14,18 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
-import type { AuthProfileCredential } from "../src/agents/auth-profiles.js";
+import { resolveDefaultAgentDir } from "../src/agents/agent-scope.js";
+import { ensureAuthProfileStore, type AuthProfileCredential } from "../src/agents/auth-profiles.js";
+import { normalizeProviderId } from "../src/agents/model-selection.js";
+import { validateAnthropicSetupToken } from "../src/commands/auth-token.js";
+import { callGateway } from "../src/gateway/call.js";
+import { extractPayloadText } from "../src/gateway/test-helpers.agent-results.js";
+import { getFreePortBlockWithPermissionFallback } from "../src/test-utils/ports.js";
 import {
   parseBooleanEnv,
   parseStrictIntegerOption,
   redactForDevToolLog,
 } from "./lib/dev-tooling-safety.ts";
-import {
-  inspectManagedProcessGroup,
-  signalExitCode,
-  terminateManagedChild,
-} from "./lib/managed-child-process.mts";
 
 const TRANSPORT = process.env.OPENCLAW_PROMPT_TRANSPORT?.trim() === "direct" ? "direct" : "gateway";
 const GATEWAY_PROMPT_MODE = "extra";
@@ -121,7 +121,6 @@ type TokenSource = {
 
 type StoppableGatewayChild = {
   exitCode: number | null;
-  pid?: number;
   signalCode: NodeJS.Signals | null;
   kill(signal: NodeJS.Signals): boolean;
   once(event: "exit", listener: () => void): unknown;
@@ -141,7 +140,7 @@ function summarizeText(text: string, max = 120): string {
   if (normalized.length <= max) {
     return normalized;
   }
-  return `${truncateUtf16Safe(normalized, max - 1)}…`;
+  return `${normalized.slice(0, max - 1)}…`;
 }
 
 function summarizeCapture(
@@ -209,20 +208,20 @@ function isSetupToken(value: string): boolean {
   return value.startsWith("sk-ant-oat01-");
 }
 
-function listSetupTokenProfiles(
-  store: { profiles: Record<string, AuthProfileCredential> },
-  normalizeProviderId: (provider: string) => string,
-): Array<{ id: string; token: string }> {
-  return Object.entries(store.profiles).flatMap(([id, cred]) => {
-    if (
-      cred.type !== "token" ||
-      normalizeProviderId(cred.provider) !== "anthropic" ||
-      !isSetupToken(cred.token ?? "")
-    ) {
-      return [];
-    }
-    return [{ id, token: cred.token ?? "" }];
-  });
+function listSetupTokenProfiles(store: {
+  profiles: Record<string, AuthProfileCredential>;
+}): Array<{ id: string; token: string }> {
+  return Object.entries(store.profiles)
+    .filter(([, cred]) => {
+      if (cred.type !== "token") {
+        return false;
+      }
+      if (normalizeProviderId(cred.provider) !== "anthropic") {
+        return false;
+      }
+      return isSetupToken(cred.token ?? "");
+    })
+    .map(([id, cred]) => ({ id, token: cred.token ?? "" }));
 }
 
 function pickSetupTokenProfile(candidates: Array<{ id: string; token: string }>): {
@@ -239,25 +238,15 @@ function pickSetupTokenProfile(candidates: Array<{ id: string; token: string }>)
   return candidates[0] ?? null;
 }
 
-async function resolveSetupTokenSource(): Promise<TokenSource> {
-  const [
-    { resolveDefaultAgentDir },
-    { ensureAuthProfileStore },
-    { normalizeProviderId },
-    tokenApi,
-  ] = await Promise.all([
-    import("../src/agents/agent-scope.js"),
-    import("../src/agents/auth-profiles.js"),
-    import("../src/agents/model-selection.js"),
-    import("../src/commands/auth-token.js"),
-  ]);
-  const validateSetupToken = (value: string): string => {
-    const error = tokenApi.validateAnthropicSetupToken(value);
-    if (error) {
-      throw new Error(`invalid setup-token: ${error}`);
-    }
-    return value;
-  };
+function validateSetupToken(value: string): string {
+  const error = validateAnthropicSetupToken(value);
+  if (error) {
+    throw new Error(`invalid setup-token: ${error}`);
+  }
+  return value;
+}
+
+function resolveSetupTokenSource(): TokenSource {
   const explicitToken =
     (SETUP_TOKEN_RAW && isSetupToken(SETUP_TOKEN_RAW) ? SETUP_TOKEN_RAW : "") || SETUP_TOKEN_VALUE;
   if (explicitToken) {
@@ -271,7 +260,7 @@ async function resolveSetupTokenSource(): Promise<TokenSource> {
   const store = ensureAuthProfileStore(agentDir, {
     allowKeychainPrompt: false,
   });
-  const candidates = listSetupTokenProfiles(store, normalizeProviderId);
+  const candidates = listSetupTokenProfiles(store);
   if (SETUP_TOKEN_PROFILE) {
     const match = candidates.find((entry) => entry.id === SETUP_TOKEN_PROFILE);
     if (!match) {
@@ -367,11 +356,7 @@ function extractProxyCapture(rawBody: string, req: http.IncomingMessage): ProxyC
   };
 }
 
-async function startAnthropicProxy(params: {
-  port: number;
-  upstreamBaseUrl: string;
-  timeoutMs: number;
-}) {
+async function startAnthropicProxy(params: { port: number; upstreamBaseUrl: string }) {
   let lastCapture: ProxyCapture | undefined;
   const sockets = new Set<import("node:net").Socket>();
   const server = http.createServer((req, res) => {
@@ -394,17 +379,15 @@ async function startAnthropicProxy(params: {
           }
           headers.set(key, Array.isArray(value) ? value.join(", ") : value);
         }
-        const upstreamInit = {
+        const upstreamRes = await fetch(upstreamUrl, {
           method,
           headers,
           body:
             method === "GET" || method === "HEAD" || requestBody.byteLength === 0
               ? undefined
-              : Uint8Array.from(requestBody),
+              : requestBody,
           duplex: "half",
-          signal: AbortSignal.timeout(params.timeoutMs),
-        } as RequestInit & { duplex: "half" };
-        const upstreamRes = await fetch(upstreamUrl, upstreamInit);
+        });
         const responseHeaders: Record<string, string> = {};
         for (const [key, value] of upstreamRes.headers.entries()) {
           const lower = key.toLowerCase();
@@ -427,12 +410,6 @@ async function startAnthropicProxy(params: {
         }
         res.end();
       } catch (error) {
-        // Once upstream headers are forwarded, a synthetic 502 is invalid.
-        // Close the downstream body so its reader fails instead of hanging.
-        if (res.headersSent) {
-          res.destroy();
-          return;
-        }
         res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
         res.end(redactForDevToolLog(`proxy error: ${String(error)}`));
       }
@@ -446,12 +423,7 @@ async function startAnthropicProxy(params: {
     server.once("error", reject);
     server.listen(params.port, "127.0.0.1", () => resolve());
   });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Anthropic capture proxy did not bind to a TCP port");
-  }
   return {
-    port: address.port,
     getLastCapture() {
       return lastCapture;
     },
@@ -471,92 +443,46 @@ async function startAnthropicProxy(params: {
 }
 
 async function getFreePort(): Promise<number> {
-  const { getFreePortBlockWithPermissionFallback } = await import("../src/test-utils/ports.js");
   return await getFreePortBlockWithPermissionFallback({
     offsets: [0, 1, 2, 4],
     fallbackBase: 44_000,
   });
 }
 
-async function runDirectPrompt(
-  prompt: string,
-  options: {
-    claudeBin?: string;
-    shutdownWaitMs?: number;
-    timeoutMs?: number;
-  } = {},
-): Promise<PromptResult> {
-  const timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
+async function runDirectPrompt(prompt: string): Promise<PromptResult> {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-direct-prompt-probe-"));
   const proxyPort = ENABLE_CAPTURE ? await getFreePort() : undefined;
   const proxy =
     ENABLE_CAPTURE && proxyPort
-      ? await startAnthropicProxy({
-          port: proxyPort,
-          upstreamBaseUrl: "https://api.anthropic.com",
-          timeoutMs,
-        })
+      ? await startAnthropicProxy({ port: proxyPort, upstreamBaseUrl: "https://api.anthropic.com" })
       : undefined;
-  const parentSignalController = createPromptProbeParentSignalController();
 
   try {
     const stdout: string[] = [];
     const stderr: string[] = [];
-    const child = spawn(
-      options.claudeBin ?? CLAUDE_BIN,
-      [...DIRECT_CLAUDE_ARGS, prompt, USER_PROMPT],
-      {
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          ...(proxyPort ? { ANTHROPIC_BASE_URL: `http://127.0.0.1:${proxyPort}` } : {}),
-          ANTHROPIC_API_KEY: "",
-          ANTHROPIC_API_KEY_OLD: "",
-        },
-        detached: process.platform !== "win32",
-        stdio: ["ignore", "pipe", "pipe"],
+    const child = spawn(CLAUDE_BIN, [...DIRECT_CLAUDE_ARGS, prompt, USER_PROMPT], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ...(proxyPort ? { ANTHROPIC_BASE_URL: `http://127.0.0.1:${proxyPort}` } : {}),
+        ANTHROPIC_API_KEY: "",
+        ANTHROPIC_API_KEY_OLD: "",
       },
-    );
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     child.stdout.on("data", (chunk) => stdout.push(String(chunk)));
     child.stderr.on("data", (chunk) => stderr.push(String(chunk)));
-    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-      (resolve, reject) => {
+    const exit = await withTimeout(
+      new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
         child.once("error", reject);
         child.once("exit", (code, signal) => resolve({ code, signal }));
+      }),
+      TIMEOUT_MS,
+      () => {
+        child.kill("SIGKILL");
+        return { code: null, signal: "SIGKILL" as NodeJS.Signals };
       },
     );
-    let stopPromise: Promise<void> | undefined;
-    const stopDirectChild = (signal: NodeJS.Signals = "SIGKILL") => {
-      if (!stopPromise) {
-        terminateManagedChild(child, signal, { useWindowsTaskkill: false });
-        stopPromise = waitForGatewayPromptChildTreeExit(
-          child,
-          options.shutdownWaitMs ?? 1_500,
-        ).then(() => undefined);
-      }
-      return stopPromise;
-    };
-    parentSignalController.attach({
-      stop: stopDirectChild,
-      forceKill: () => {
-        terminateManagedChild(child, "SIGKILL", { useWindowsTaskkill: false });
-      },
-    });
-    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-    const exit = await Promise.race([
-      exitPromise,
-      new Promise<{ code: null; signal: NodeJS.Signals }>((resolve) => {
-        timeoutTimer = setTimeout(() => {
-          void stopDirectChild("SIGKILL").finally(() => {
-            resolve({ code: null, signal: "SIGKILL" });
-          });
-        }, timeoutMs);
-      }),
-    ]).finally(() => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-      }
-    });
     const joinedStdout = stdout.join("");
     const joinedStderr = stderr.join("");
     return {
@@ -572,7 +498,6 @@ async function runDirectPrompt(
       ...promptProbeTmpResult(tmpDir),
     };
   } finally {
-    parentSignalController.dispose();
     await proxy?.stop().catch(() => {});
     await cleanupPromptProbeTmpDir(tmpDir).catch(() => {});
   }
@@ -588,7 +513,6 @@ async function startGatewayProcess(params: {
   logPath: string;
 }) {
   const logFile = await fs.open(params.logPath, "a");
-  const parentSignalController = createPromptProbeParentSignalController();
   const child = spawn(
     NODE_BIN,
     ["openclaw.mjs", "gateway", "--port", String(params.port), "--bind", "loopback", "--force"],
@@ -611,7 +535,6 @@ async function startGatewayProcess(params: {
         ANTHROPIC_API_KEY: "",
         ANTHROPIC_API_KEY_OLD: "",
       },
-      detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -631,29 +554,16 @@ async function startGatewayProcess(params: {
   };
   child.stdout.on("data", trackLogWrite);
   child.stderr.on("data", trackLogWrite);
-  let stopPromise: Promise<boolean> | undefined;
-  const stopOnce = async (): Promise<boolean> => {
-    stopPromise ??= stopGatewayPromptChild(
-      child,
-      logFile,
-      1_500,
-      1_500,
-      pendingLogWrites,
-      logWriteErrors,
-    ).finally(() => {
-      parentSignalController.dispose();
-    });
-    return await stopPromise;
-  };
-  parentSignalController.attach({
-    stop: stopOnce,
-    forceKill: () => {
-      terminateManagedChild(child, "SIGKILL", { useWindowsTaskkill: false });
-    },
-  });
   return {
     async stop(): Promise<boolean> {
-      return await stopOnce();
+      return await stopGatewayPromptChild(
+        child,
+        logFile,
+        1_500,
+        1_500,
+        pendingLogWrites,
+        logWriteErrors,
+      );
     },
   };
 }
@@ -667,18 +577,29 @@ async function stopGatewayPromptChild(
   logWriteErrors: readonly unknown[] = [],
 ): Promise<boolean> {
   let exited = child.exitCode !== null || child.signalCode !== null;
+  const exitPromise = exited
+    ? Promise.resolve()
+    : new Promise<void>((resolve) => {
+        child.once("exit", () => {
+          exited = true;
+          resolve();
+        });
+      });
   if (!exited) {
-    child.once("exit", () => {
-      exited = true;
-    });
+    child.kill("SIGINT");
   }
-  if (!exited) {
-    terminateManagedChild(child, "SIGINT", { useWindowsTaskkill: false });
-  }
-  const exitedAfterSigint = await waitForGatewayPromptChildTreeExit(child, sigintTimeoutMs);
-  if (!exitedAfterSigint) {
-    terminateManagedChild(child, "SIGKILL", { useWindowsTaskkill: false });
-    await waitForGatewayPromptChildTreeExit(child, sigkillTimeoutMs);
+  const exitedAfterSigint = await withTimeout(
+    exitPromise.then(() => true),
+    sigintTimeoutMs,
+    () => false,
+  );
+  if (!exitedAfterSigint && !exited) {
+    child.kill("SIGKILL");
+    await withTimeout(
+      exitPromise.then(() => true),
+      sigkillTimeoutMs,
+      () => false,
+    );
   }
   const failedLogWrite = (await Promise.allSettled(pendingLogWrites)).find(
     (result): result is PromiseRejectedResult => result.status === "rejected",
@@ -691,91 +612,7 @@ async function stopGatewayPromptChild(
   return exited;
 }
 
-// Arm before spawn so a parent signal is retained until child cleanup can attach.
-// The first signal owns the exit code; later signals only escalate cleanup.
-function createPromptProbeParentSignalController() {
-  let attachment: { forceKill(): void; stop(): Promise<unknown> } | undefined;
-  let forceKillPending = false;
-  let receivedSignal: NodeJS.Signals | undefined;
-  let shutdownPromise: Promise<unknown> | undefined;
-  const handlers = new Map<NodeJS.Signals, () => void>();
-  const dispose = () => {
-    for (const [signal, handler] of handlers) {
-      process.off(signal, handler);
-    }
-    handlers.clear();
-  };
-  const forceKill = () => {
-    try {
-      attachment?.forceKill();
-    } catch {}
-  };
-  const startShutdown = () => {
-    if (!attachment || !receivedSignal || shutdownPromise) {
-      return;
-    }
-    const attached = attachment;
-    const exitCode = signalExitCode(receivedSignal);
-    if (forceKillPending) {
-      forceKillPending = false;
-      forceKill();
-    }
-    shutdownPromise = Promise.resolve()
-      .then(() => attached.stop())
-      .catch(() => undefined)
-      .finally(() => {
-        dispose();
-        process.exit(exitCode);
-      });
-  };
-  for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"] satisfies NodeJS.Signals[]) {
-    const handler = () => {
-      if (receivedSignal) {
-        if (attachment) {
-          forceKill();
-        } else {
-          forceKillPending = true;
-        }
-        return;
-      }
-      receivedSignal = signal;
-      startShutdown();
-    };
-    handlers.set(signal, handler);
-    process.on(signal, handler);
-  }
-  return {
-    attach(nextAttachment: NonNullable<typeof attachment>) {
-      attachment ??= nextAttachment;
-      startShutdown();
-    },
-    dispose,
-  };
-}
-
-async function waitForGatewayPromptChildTreeExit(
-  child: StoppableGatewayChild,
-  timeoutMs: number,
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  const groupOptions = {
-    errorPolicy: "alive-on-eperm",
-    inspectLeaderWhenNoGroup: true,
-  } as const;
-  const childTreeExited = () =>
-    (child.exitCode !== null || child.signalCode !== null) &&
-    inspectManagedProcessGroup(child, groupOptions) !== "live";
-  while (Date.now() < deadline) {
-    if (childTreeExited()) {
-      return true;
-    }
-    await sleep(Math.min(25, Math.max(0, deadline - Date.now())));
-  }
-  return childTreeExited();
-}
-
 async function waitForGatewayReady(url: string, token: string): Promise<void> {
-  const { callGateway } = await import("../src/gateway/call.js");
   const deadline = Date.now() + 45_000;
   let lastError = "gateway start timeout";
   while (Date.now() < deadline) {
@@ -816,11 +653,7 @@ async function readLogTail(logPath: string, maxBytes = GATEWAY_LOG_TAIL_BYTES): 
 }
 
 async function runGatewayPrompt(prompt: string): Promise<PromptResult> {
-  const tokenSource = await resolveSetupTokenSource();
-  const [{ callGateway }, { extractPayloadText }] = await Promise.all([
-    import("../src/gateway/call.js"),
-    import("../src/gateway/test-helpers.agent-results.js"),
-  ]);
+  const tokenSource = resolveSetupTokenSource();
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-gateway-prompt-probe-"));
   const stateDir = path.join(tmpDir, "state");
   const agentDir = path.join(stateDir, "agents", "main", "agent");
@@ -832,11 +665,7 @@ async function runGatewayPrompt(prompt: string): Promise<PromptResult> {
   const proxyPort = ENABLE_CAPTURE ? await getFreePort() : undefined;
   const proxy =
     ENABLE_CAPTURE && proxyPort
-      ? await startAnthropicProxy({
-          port: proxyPort,
-          upstreamBaseUrl: "https://api.anthropic.com",
-          timeoutMs: GATEWAY_TIMEOUT_MS,
-        })
+      ? await startAnthropicProxy({ port: proxyPort, upstreamBaseUrl: "https://api.anthropic.com" })
       : undefined;
   let gateway: Awaited<ReturnType<typeof startGatewayProcess>> | undefined;
 
@@ -854,6 +683,7 @@ async function runGatewayPrompt(prompt: string): Promise<PromptResult> {
           },
           discovery: {
             mdns: { mode: "off" },
+            wideArea: { enabled: false },
           },
           ...(proxyPort
             ? {
@@ -951,21 +781,19 @@ async function runGatewayPrompt(prompt: string): Promise<PromptResult> {
       mode: "cli",
     });
     const text = extractPayloadText(waitRes);
-    const waitStatus = typeof waitRes.status === "string" ? waitRes.status : undefined;
-    const waitError = typeof waitRes.error === "string" ? waitRes.error : undefined;
     const logTail = await readLogTail(logPath);
-    const matched400 = matchesExtraUsage400(waitError, logTail, JSON.stringify(waitRes));
+    const matched400 = matchesExtraUsage400(waitRes.error, logTail, JSON.stringify(waitRes));
     return {
       prompt,
-      ok: waitStatus === "ok" && !matched400,
+      ok: waitRes.status === "ok" && !matched400,
       transport: "gateway",
       promptMode: GATEWAY_PROMPT_MODE,
-      status: waitStatus,
+      status: waitRes.status,
       text: text || undefined,
       error:
-        waitStatus === "ok"
+        waitRes.status === "ok"
           ? undefined
-          : redactForDevToolLog(waitError || logTail || "agent.wait failed"),
+          : redactForDevToolLog(waitRes.error || logTail || "agent.wait failed"),
       matchedExtraUsage400: matched400,
       capture: summarizeCapture(proxy?.getLastCapture(), prompt),
       ...promptProbeTmpResult(tmpDir),
@@ -1006,14 +834,14 @@ async function main() {
 
 export const testing = {
   cleanupPromptProbeTmpDir,
-  createPromptProbeParentSignalController,
+  matchesExtraUsage400,
   promptProbeTmpResult,
   readLogTail,
   readRequestBody,
   resolveAnthropicUpstreamUrl,
-  runDirectPrompt,
-  startAnthropicProxy,
   stopGatewayPromptChild,
+  summarizeCapture,
+  summarizeText,
 };
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

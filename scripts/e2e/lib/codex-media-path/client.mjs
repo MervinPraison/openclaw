@@ -5,10 +5,10 @@ import { PROTOCOL_VERSION } from "../../../../dist/gateway/protocol/index.js";
 import { renderBitmapTextPngBase64 } from "../../../../test/helpers/live-image-probe.ts";
 import { createGatewayWsClient } from "../../../lib/gateway-ws-client.ts";
 import { resolveGatewaySuccessPayload } from "../gateway-frame-payload.mjs";
-import { createJsonlRequestTailer } from "./jsonl-request-tail.mts";
-import { readPositiveIntEnv, readTcpPortEnv } from "./limits.mjs";
+import { createJsonlRequestTailer } from "./jsonl-request-tail.mjs";
+import { readPositiveIntEnv } from "./limits.mjs";
 
-const portText = process.env.PORT;
+const port = process.env.PORT;
 const token = process.env.OPENCLAW_GATEWAY_TOKEN;
 const appServerLog =
   process.env.OPENCLAW_CODEX_MEDIA_PATH_APP_SERVER_LOG ??
@@ -19,10 +19,9 @@ const logTailMaxBytes = readPositiveIntEnv(
   2 * 1024 * 1024,
 );
 
-if (!portText || !token) {
+if (!port || !token) {
   throw new Error("missing PORT/OPENCLAW_GATEWAY_TOKEN");
 }
-const port = readTcpPortEnv("PORT", portText);
 
 function assert(condition, message) {
   if (!condition) {

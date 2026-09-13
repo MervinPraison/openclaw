@@ -1,28 +1,16 @@
 // Resource ceiling assertions for Docker E2E stats output.
 import fs from "node:fs";
+import { createInterface } from "node:readline";
 
 const [statsFile, maxMemoryRaw, maxCpuRaw, label = "docker"] = process.argv.slice(2);
-const NON_NEGATIVE_DECIMAL_PATTERN = /^(?:0|[1-9]\d*)(?:\.\d+)?$/u;
-const MAX_STATS_SAMPLE_LINE_BYTES = 1024 * 1024;
+const maxMemoryMiB = Number(maxMemoryRaw);
+const maxCpuPercent = Number(maxCpuRaw);
 
-function parseFiniteLimit(raw, name) {
-  const text = String(raw ?? "").trim();
-  if (!NON_NEGATIVE_DECIMAL_PATTERN.test(text)) {
-    throw new Error(
-      `${name} must be a finite non-negative number in decimal notation. Got: ${JSON.stringify(raw)}`,
-    );
+function assertFiniteLimit(value, raw, name) {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a finite non-negative number. Got: ${JSON.stringify(raw)}`);
   }
-  const parsed = Number(text);
-  if (!Number.isFinite(parsed)) {
-    throw new Error(
-      `${name} must be a finite non-negative number in decimal notation. Got: ${JSON.stringify(raw)}`,
-    );
-  }
-  return parsed;
 }
-
-const maxMemoryMiB = parseFiniteLimit(maxMemoryRaw, "max memory MiB");
-const maxCpuPercent = parseFiniteLimit(maxCpuRaw, "max CPU percent");
 
 function parseMemoryMiB(raw) {
   const value =
@@ -57,12 +45,7 @@ function parseMemoryMiB(raw) {
 }
 
 function parseCpuPercent(raw) {
-  const text = String(raw ?? "").trim();
-  const valueText = text.endsWith("%") ? text.slice(0, -1).trim() : text;
-  if (!NON_NEGATIVE_DECIMAL_PATTERN.test(valueText)) {
-    return undefined;
-  }
-  const parsed = Number(valueText);
+  const parsed = Number(String(raw || "").replace(/%$/u, ""));
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
@@ -92,61 +75,20 @@ async function scanStatsFileLines(file, onLine) {
     return;
   }
   const input = fs.createReadStream(file, { encoding: "utf8" });
-  let pending = "";
-  let pendingBytes = 0;
-  let skipLineFeedAfterCarriageReturn = false;
-
-  const appendSegment = (segment) => {
-    if (!segment) {
-      return;
-    }
-    const segmentBytes = Buffer.byteLength(segment, "utf8");
-    if (pendingBytes + segmentBytes > MAX_STATS_SAMPLE_LINE_BYTES) {
-      throw new Error(
-        `docker stats sample for ${label} exceeded ${MAX_STATS_SAMPLE_LINE_BYTES} bytes`,
-      );
-    }
-    pending += segment;
-    pendingBytes += segmentBytes;
-  };
-  const emitPendingLine = () => {
-    const line = pending.endsWith("\r") ? pending.slice(0, -1) : pending;
-    pending = "";
-    pendingBytes = 0;
+  const lines = createInterface({ crlfDelay: Infinity, input });
+  for await (const line of lines) {
     if (line) {
       onLine(line);
     }
-  };
-
-  for await (const chunk of input) {
-    let start = 0;
-    for (let index = 0; index < chunk.length; index += 1) {
-      const code = chunk.charCodeAt(index);
-      if (skipLineFeedAfterCarriageReturn) {
-        skipLineFeedAfterCarriageReturn = false;
-        if (code === 10) {
-          start = index + 1;
-          continue;
-        }
-      }
-      if (code !== 10 && code !== 13) {
-        continue;
-      }
-      appendSegment(chunk.slice(start, index));
-      emitPendingLine();
-      skipLineFeedAfterCarriageReturn = code === 13;
-      start = index + 1;
-    }
-    appendSegment(chunk.slice(start));
-  }
-  if (pending) {
-    emitPendingLine();
   }
 }
 
 let maxObservedMemoryMiB = 0;
 let maxObservedCpuPercent = 0;
 let parsedSamples = 0;
+
+assertFiniteLimit(maxMemoryMiB, maxMemoryRaw, "max memory MiB");
+assertFiniteLimit(maxCpuPercent, maxCpuRaw, "max CPU percent");
 
 await scanStatsFileLines(statsFile, (line) => {
   let parsed;
