@@ -47,7 +47,7 @@ func main() {
 		docsRoot     = flag.String("docs", "docs", "docs root")
 		tmPath       = flag.String("tm", "", "translation memory path")
 		mode         = flag.String("mode", "segment", "translation mode (segment|doc)")
-		thinking     = flag.String("thinking", "xhigh", "thinking level (low|medium|high|xhigh|max)")
+		thinking     = flag.String("thinking", "high", "thinking level (low|medium|high|xhigh)")
 		overwrite    = flag.Bool("overwrite", false, "overwrite existing translations")
 		allowPartial = flag.Bool("allow-partial", false, "write successful doc-mode outputs even when another file fails")
 		maxFiles     = flag.Int("max", 0, "max files to process (0 = all)")
@@ -109,17 +109,15 @@ func runDocsI18N(ctx context.Context, cfg runConfig, files []string, newTranslat
 	}
 	totalFiles := len(ordered)
 	preSkipped := 0
-	prePostprocessFiles := []string{}
 	if cfg.mode == "doc" && !cfg.overwrite {
-		filtered, skipped, existingOutputs, err := filterDocQueue(resolvedDocsRoot, cfg.targetLang, ordered, cfg.maxFiles)
+		filtered, skipped, err := filterDocQueue(resolvedDocsRoot, cfg.targetLang, ordered)
 		if err != nil {
 			return err
 		}
 		ordered = filtered
 		preSkipped = skipped
-		prePostprocessFiles = append(prePostprocessFiles, existingOutputs...)
 	}
-	if (cfg.mode != "doc" || cfg.overwrite) && cfg.maxFiles > 0 && cfg.maxFiles < len(ordered) {
+	if cfg.maxFiles > 0 && cfg.maxFiles < len(ordered) {
 		ordered = ordered[:cfg.maxFiles]
 	}
 
@@ -132,7 +130,7 @@ func runDocsI18N(ctx context.Context, cfg runConfig, files []string, newTranslat
 	start := time.Now()
 	processed := 0
 	skipped := 0
-	localizedFiles := append([]string{}, prePostprocessFiles...)
+	localizedFiles := []string{}
 	var translationErr error
 
 	log.Printf("docs-i18n: mode=%s total=%d pending=%d pre_skipped=%d overwrite=%t thinking=%s parallel=%d", cfg.mode, totalFiles, len(ordered), preSkipped, cfg.overwrite, cfg.thinking, parallel)
@@ -219,9 +217,6 @@ func runDocSequential(ctx context.Context, ordered []string, translator docsTran
 		}
 		if skip {
 			skipped++
-			if outputPath != "" {
-				outputs = append(outputs, outputPath)
-			}
 			log.Printf("docs-i18n: [%d/%d] skipped %s (%s)", index+1, len(ordered), relPath, time.Since(start).Round(time.Millisecond))
 		} else {
 			processed++
@@ -299,9 +294,6 @@ func runDocParallel(ctx context.Context, ordered []string, docsRoot, srcLang, tg
 		}
 		if result.skipped {
 			skipped++
-			if result.output != "" {
-				outputs = append(outputs, result.output)
-			}
 			log.Printf("docs-i18n: [w* %d/%d] skipped %s (%s)", result.index, len(ordered), result.rel, result.duration.Round(time.Millisecond))
 		} else if result.err != nil {
 			log.Printf("docs-i18n: [w* %d/%d] failed %s (%s): %v", result.index, len(ordered), result.rel, result.duration.Round(time.Millisecond), result.err)
@@ -347,40 +339,29 @@ func resolveRelPath(docsRoot, file string) string {
 	return relPath
 }
 
-func filterDocQueue(docsRoot, targetLang string, ordered []string, maxFiles int) ([]string, int, []string, error) {
+func filterDocQueue(docsRoot, targetLang string, ordered []string) ([]string, int, error) {
 	pending := make([]string, 0, len(ordered))
-	existingOutputs := []string{}
 	skipped := 0
 	for _, file := range ordered {
 		absPath, relPath, err := resolveDocsPath(docsRoot, file)
 		if err != nil {
-			return nil, skipped, nil, err
+			return nil, skipped, err
 		}
 		content, err := os.ReadFile(absPath)
 		if err != nil {
-			return nil, skipped, nil, err
+			return nil, skipped, err
 		}
 		sourceHash := hashBytes(content)
 		outputPath := filepath.Join(docsRoot, targetLang, relPath)
-		status, err := classifyDocOutput(outputPath, sourceHash, targetLang)
+		skip, err := shouldSkipDoc(outputPath, sourceHash)
 		if err != nil {
-			return nil, skipped, nil, err
+			return nil, skipped, err
 		}
-		switch status {
-		case docOutputReady:
+		if skip {
 			skipped++
-		case docOutputNeedsPostprocess:
-			if maxFiles > 0 && len(pending)+len(existingOutputs) >= maxFiles {
-				continue
-			}
-			skipped++
-			existingOutputs = append(existingOutputs, outputPath)
-		case docOutputNeedsTranslation:
-			if maxFiles > 0 && len(pending)+len(existingOutputs) >= maxFiles {
-				continue
-			}
-			pending = append(pending, file)
+			continue
 		}
+		pending = append(pending, file)
 	}
-	return pending, skipped, existingOutputs, nil
+	return pending, skipped, nil
 }

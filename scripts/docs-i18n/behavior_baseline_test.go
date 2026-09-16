@@ -86,8 +86,7 @@ func matchesAll(text string, fragments []string) bool {
 }
 
 func TestDocsI18nBehaviorBaselines(t *testing.T) {
-	t.Setenv("OPENCLAW_DOCS_I18N_DOC_CHUNK_MAX_BYTES", "4096")
-	t.Setenv("OPENCLAW_DOCS_I18N_DOC_CHUNK_PROMPT_BUDGET", "15000")
+	t.Parallel()
 
 	root := filepath.Join("testdata", "behavior")
 	entries, err := os.ReadDir(root)

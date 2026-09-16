@@ -1,12 +1,9 @@
 // Prunes omitted bundled plugin files and their unshared runtime dependencies
-// from Docker-oriented production package output, then links the retained
-// externally distributed plugins' own dependencies under their packaged roots.
+// from Docker-oriented production package output.
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { collectRootPackageExcludedExtensionDirs } from "./lib/bundled-plugin-build-entries.mjs";
-import { linkSourcePluginDependencies } from "./lib/bundled-plugin-dependency-links.mjs";
-import { assertRealOutputRoot } from "./lib/output-root-guard.mjs";
 import { removePathIfExists } from "./runtime-postbuild-shared.mjs";
 
 const RUNTIME_DEPENDENCY_FIELDS = ["dependencies", "optionalDependencies"];
@@ -37,16 +34,10 @@ function readPackageJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
-function collectRuntimeDependencyNames(packageJson, options = {}) {
+function collectRuntimeDependencyNames(packageJson) {
   const dependencies = new Set();
   for (const field of RUNTIME_DEPENDENCY_FIELDS) {
     for (const dependencyName of Object.keys(packageJson?.[field] ?? {})) {
-      dependencies.add(dependencyName);
-    }
-  }
-  for (const dependencyName of Object.keys(packageJson?.peerDependencies ?? {})) {
-    const optional = packageJson?.peerDependenciesMeta?.[dependencyName]?.optional === true;
-    if (options.includeOptionalPeers === true || !optional) {
       dependencies.add(dependencyName);
     }
   }
@@ -55,24 +46,6 @@ function collectRuntimeDependencyNames(packageJson, options = {}) {
 
 function nodeModulePath(repoRoot, packageName) {
   return path.join(repoRoot, "node_modules", ...packageName.split("/"));
-}
-
-// Follow Node's importer-relative lookup: hoisted installs can contain several versions,
-// and root-only traversal can misclassify a kept dependency as exclusive to an omitted plugin.
-function resolveNodeModulePackageDir(importerDir, packageName) {
-  let currentDir = fs.realpathSync(importerDir);
-
-  while (true) {
-    const packageDir = path.join(currentDir, "node_modules", ...packageName.split("/"));
-    if (fs.existsSync(path.join(packageDir, "package.json"))) {
-      return fs.realpathSync(packageDir);
-    }
-    const parentDir = path.dirname(currentDir);
-    if (parentDir === currentDir) {
-      return null;
-    }
-    currentDir = parentDir;
-  }
 }
 
 function removeEmptyScopeDir(repoRoot, packageName) {
@@ -88,41 +61,32 @@ function removeEmptyScopeDir(repoRoot, packageName) {
   }
 }
 
-function collectPackageRuntimeClosure(repoRoot, seeds, options = {}) {
-  const packageDirs = new Set();
-  const rootPackageNames = new Set();
-  const stack = [...seeds];
+function collectPackageRuntimeClosure(repoRoot, seedPackageNames) {
+  const seen = new Set();
+  const stack = [...seedPackageNames];
 
   while (stack.length > 0) {
-    const entry = stack.pop();
-    const packageDir = resolveNodeModulePackageDir(entry.importerDir, entry.packageName);
-    if (!packageDir) {
+    const packageName = stack.pop();
+    if (!packageName || seen.has(packageName)) {
       continue;
     }
+    seen.add(packageName);
 
-    const rootPackageDir = nodeModulePath(repoRoot, entry.packageName);
-    if (
-      fs.existsSync(path.join(rootPackageDir, "package.json")) &&
-      fs.realpathSync(rootPackageDir) === packageDir
-    ) {
-      rootPackageNames.add(entry.packageName);
-    }
-    if (packageDirs.has(packageDir)) {
-      continue;
-    }
-    packageDirs.add(packageDir);
-
-    const packageJson = readPackageJson(path.join(packageDir, "package.json"));
-    for (const dependencyName of collectRuntimeDependencyNames(packageJson, options)) {
-      stack.push({ importerDir: packageDir, packageName: dependencyName });
+    const packageJson = readPackageJson(
+      path.join(nodeModulePath(repoRoot, packageName), "package.json"),
+    );
+    for (const dependencyName of collectRuntimeDependencyNames(packageJson)) {
+      if (!seen.has(dependencyName)) {
+        stack.push(dependencyName);
+      }
     }
   }
 
-  return { packageDirs, rootPackageNames };
+  return seen;
 }
 
 function collectWorkspacePackageRuntimeSeeds(repoRoot, workspaceDir, excludedPluginIds) {
-  const seeds = [];
+  const seeds = new Set();
   const workspaceRoot = path.join(repoRoot, workspaceDir);
   if (!fs.existsSync(workspaceRoot)) {
     return seeds;
@@ -132,13 +96,12 @@ function collectWorkspacePackageRuntimeSeeds(repoRoot, workspaceDir, excludedPlu
     if (!entry.isDirectory() || excludedPluginIds.has(entry.name)) {
       continue;
     }
-    const importerDir = path.join(workspaceRoot, entry.name);
-    const packageJson = readPackageJson(path.join(importerDir, "package.json"));
+    const packageJson = readPackageJson(path.join(workspaceRoot, entry.name, "package.json"));
     if (typeof packageJson?.name === "string") {
-      seeds.push({ importerDir, packageName: packageJson.name });
+      seeds.add(packageJson.name);
     }
-    for (const packageName of collectRuntimeDependencyNames(packageJson)) {
-      seeds.push({ importerDir, packageName });
+    for (const dependencyName of collectRuntimeDependencyNames(packageJson)) {
+      seeds.add(dependencyName);
     }
   }
   return seeds;
@@ -147,46 +110,49 @@ function collectWorkspacePackageRuntimeSeeds(repoRoot, workspaceDir, excludedPlu
 function pruneNodeModulesForOmittedPlugins(repoRoot, bundledPluginDir, omittedPluginIds) {
   const rootPackageJson = readPackageJson(path.join(repoRoot, "package.json"));
   const omittedPackageNames = new Set();
-  const omittedSeeds = [];
+  const omittedSeeds = new Set();
 
   for (const pluginId of omittedPluginIds) {
-    const importerDir = path.join(repoRoot, bundledPluginDir, pluginId);
-    const packageJson = readPackageJson(path.join(importerDir, "package.json"));
+    const packageJson = readPackageJson(
+      path.join(repoRoot, bundledPluginDir, pluginId, "package.json"),
+    );
     if (typeof packageJson?.name === "string") {
       omittedPackageNames.add(packageJson.name);
     }
-    for (const packageName of collectRuntimeDependencyNames(packageJson)) {
-      omittedSeeds.push({ importerDir, packageName });
+    for (const dependencyName of collectRuntimeDependencyNames(packageJson)) {
+      omittedSeeds.add(dependencyName);
     }
   }
 
-  const keptSeeds = [...collectRuntimeDependencyNames(rootPackageJson)].map((packageName) => ({
-    importerDir: repoRoot,
-    packageName,
-  }));
-  keptSeeds.push(...collectWorkspacePackageRuntimeSeeds(repoRoot, "packages", new Set()));
-  keptSeeds.push(
-    ...collectWorkspacePackageRuntimeSeeds(repoRoot, bundledPluginDir, omittedPluginIds),
-  );
+  const keptSeeds = new Set(collectRuntimeDependencyNames(rootPackageJson));
+  for (const dependencyName of collectWorkspacePackageRuntimeSeeds(
+    repoRoot,
+    "packages",
+    new Set(),
+  )) {
+    keptSeeds.add(dependencyName);
+  }
+  for (const dependencyName of collectWorkspacePackageRuntimeSeeds(
+    repoRoot,
+    bundledPluginDir,
+    omittedPluginIds,
+  )) {
+    keptSeeds.add(dependencyName);
+  }
 
   const keptClosure = collectPackageRuntimeClosure(repoRoot, keptSeeds);
-  // Hoisted workspace dev dependencies can satisfy optional peers of omitted
-  // plugins. Treat those installed peer-only branches as removal candidates;
-  // the kept runtime closure below remains authoritative.
-  const omittedClosure = collectPackageRuntimeClosure(repoRoot, omittedSeeds, {
-    includeOptionalPeers: true,
-  });
+  const omittedClosure = collectPackageRuntimeClosure(repoRoot, omittedSeeds);
   const removed = [];
-  const removalCandidates = new Set([...omittedPackageNames, ...omittedClosure.rootPackageNames]);
+  const removalCandidates = new Set([...omittedPackageNames, ...omittedClosure]);
 
   for (const packageName of [...removalCandidates].toSorted((left, right) =>
     left.localeCompare(right),
   )) {
-    const packageDir = nodeModulePath(repoRoot, packageName);
-    if (!fs.existsSync(packageDir)) {
+    if (keptClosure.has(packageName)) {
       continue;
     }
-    if (keptClosure.packageDirs.has(fs.realpathSync(packageDir))) {
+    const packageDir = nodeModulePath(repoRoot, packageName);
+    if (!fs.existsSync(packageDir)) {
       continue;
     }
     removePathIfExists(packageDir);
@@ -197,45 +163,8 @@ function pruneNodeModulesForOmittedPlugins(repoRoot, bundledPluginDir, omittedPl
   return removed;
 }
 
-// Docker compiles selected externally distributed plugins into the unified dist
-// graph, but their dependencies stay plugin-local under the isolated pnpm install
-// instead of the root node_modules that dist/extensions/<id> can reach. Link them
-// under the packaged root, as isolated source checkouts do, and fail closed when a
-// declared dependency still does not resolve from there: the plugin would otherwise
-// ship loadable-looking but be rejected by dependency diagnostics at runtime.
-function linkRetainedPluginDependencies(repoRoot, bundledPluginDir, retainedPluginIds) {
-  const unreachable = [];
-  for (const pluginId of [...retainedPluginIds].toSorted((left, right) =>
-    left.localeCompare(right),
-  )) {
-    const distPluginDir = path.join(repoRoot, "dist", "extensions", pluginId);
-    if (!fs.existsSync(distPluginDir)) {
-      continue;
-    }
-    const pluginDir = path.join(repoRoot, bundledPluginDir, pluginId);
-    const distNodeModules = path.join(distPluginDir, "node_modules");
-    fs.rmSync(distNodeModules, { recursive: true, force: true });
-    linkSourcePluginDependencies(pluginDir, distNodeModules);
-    const packageJson = readPackageJson(path.join(pluginDir, "package.json"));
-    for (const packageName of Object.keys(packageJson?.dependencies ?? {})) {
-      if (
-        !(packageName in (packageJson.optionalDependencies ?? {})) &&
-        !resolveNodeModulePackageDir(distPluginDir, packageName)
-      ) {
-        unreachable.push(`${pluginId}: ${packageName}`);
-      }
-    }
-  }
-  if (unreachable.length > 0) {
-    throw new Error(
-      `plugin dependencies are not reachable from their packaged dist roots:\n${unreachable.join("\n")}`,
-    );
-  }
-}
-
 /**
- * Removes omitted plugin dist trees plus node_modules packages not needed by kept runtime code,
- * then links retained externally distributed plugin dependencies under their packaged roots.
+ * Removes omitted plugin dist trees plus node_modules packages not needed by kept runtime code.
  */
 export function pruneDockerPluginDist(params = {}) {
   const repoRoot = params.cwd ?? params.repoRoot ?? process.cwd();
@@ -247,11 +176,6 @@ export function pruneDockerPluginDist(params = {}) {
     [...excludedPluginIds].filter((pluginId) => !keepPluginIds.has(pluginId)),
   );
   const removed = [];
-
-  // The removals below recurse into dist/ and dist-runtime/ plugin trees;
-  // refuse to follow a symlinked output root into its target.
-  assertRealOutputRoot(path.join(repoRoot, "dist"));
-  assertRealOutputRoot(path.join(repoRoot, "dist-runtime"));
 
   removed.push(...pruneNodeModulesForOmittedPlugins(repoRoot, bundledPluginDir, omittedPluginIds));
 
@@ -271,12 +195,6 @@ export function pruneDockerPluginDist(params = {}) {
       removed.push(path.relative(repoRoot, absolutePluginPath).replaceAll("\\", "/"));
     }
   }
-
-  linkRetainedPluginDependencies(
-    repoRoot,
-    bundledPluginDir,
-    [...excludedPluginIds].filter((pluginId) => keepPluginIds.has(pluginId)),
-  );
 
   return removed;
 }

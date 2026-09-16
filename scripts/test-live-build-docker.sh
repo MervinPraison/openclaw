@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
-if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
-  exec /bin/bash "$0" "$@"
-fi
 set -euo pipefail
 
 SCRIPT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,7 +22,13 @@ if ! [[ "$LIVE_IMAGE_PULL_RETRY_DELAY_SECONDS" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-DOCKER_BUILD_EXTENSIONS="$(node "$SCRIPT_ROOT_DIR/scripts/print-live-docker-plugin-selection.mjs" "$ROOT_DIR" "$DOCKER_BUILD_EXTENSIONS")"
+case " ${DOCKER_BUILD_EXTENSIONS} " in
+  *" matrix "*)
+    ;;
+  *)
+    DOCKER_BUILD_EXTENSIONS="${DOCKER_BUILD_EXTENSIONS:+${DOCKER_BUILD_EXTENSIONS} }matrix"
+    ;;
+esac
 
 DOCKER_BUILD_ARGS=()
 if [[ -n "${DOCKER_BUILD_EXTENSIONS}" ]]; then
@@ -52,10 +54,6 @@ if [[ "${OPENCLAW_SKIP_DOCKER_BUILD:-}" == "1" ]]; then
   if docker_e2e_docker_cmd image inspect "$LIVE_IMAGE_NAME" >/dev/null 2>&1; then
     exit 0
   fi
-  if [[ "${OPENCLAW_LIVE_REQUIRE_LOCAL_IMAGE:-0}" == "1" ]]; then
-    echo "Required local live-test image not found: $LIVE_IMAGE_NAME" >&2
-    exit 1
-  fi
   echo "==> Live-test image not found locally; pulling: $LIVE_IMAGE_NAME"
   if pull_live_image; then
     exit 0
@@ -70,4 +68,4 @@ fi
 
 echo "==> Build live-test image: $LIVE_IMAGE_NAME (target=build)"
 echo "==> Bundled plugins: ${DOCKER_BUILD_EXTENSIONS}"
-docker_build_run live-build ${DOCKER_BUILD_ARGS[@]+"${DOCKER_BUILD_ARGS[@]}"} --target build -t "$LIVE_IMAGE_NAME" -f "$ROOT_DIR/Dockerfile" "$ROOT_DIR"
+docker_build_run live-build "${DOCKER_BUILD_ARGS[@]}" --target build -t "$LIVE_IMAGE_NAME" -f "$ROOT_DIR/Dockerfile" "$ROOT_DIR"

@@ -1,8 +1,6 @@
 // Mock server for minimal OpenAI web-search E2E scenarios.
-import fs from "node:fs";
 import http from "node:http";
-import https from "node:https";
-import { readTcpPortEnv } from "../env-limits.mjs";
+import { readPositiveIntEnv } from "../env-limits.mjs";
 import {
   boundedRequestLogBody,
   isRequestBodyTooLargeError,
@@ -12,16 +10,10 @@ import {
   writeSse,
 } from "../mock-openai-http.mjs";
 
-const port = readTcpPortEnv("MOCK_PORT");
+const port = readPositiveIntEnv("MOCK_PORT");
 const requestLog = process.env.MOCK_REQUEST_LOG;
 const successMarker = process.env.SUCCESS_MARKER;
 const rawSchemaError = process.env.RAW_SCHEMA_ERROR;
-const tlsCertPath = process.env.MOCK_TLS_CERT?.trim();
-const tlsKeyPath = process.env.MOCK_TLS_KEY?.trim();
-
-if (Boolean(tlsCertPath) !== Boolean(tlsKeyPath)) {
-  throw new Error("MOCK_TLS_CERT and MOCK_TLS_KEY must be set together");
-}
 
 function writeOpenAiReject(res) {
   writeJson(res, 400, {
@@ -96,9 +88,9 @@ function responseEvents(text) {
   ];
 }
 
-const handleRequest = (req, res) => {
+const server = http.createServer((req, res) => {
   void (async () => {
-    const url = new URL(req.url ?? "/", "https://api.openai.com");
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/health") {
       writeJson(res, 200, { ok: true });
       return;
@@ -167,19 +159,8 @@ const handleRequest = (req, res) => {
     }
     res.destroy(error instanceof Error ? error : new Error(message));
   });
-};
-
-const server =
-  tlsCertPath && tlsKeyPath
-    ? https.createServer(
-        {
-          cert: fs.readFileSync(tlsCertPath),
-          key: fs.readFileSync(tlsKeyPath),
-        },
-        handleRequest,
-      )
-    : http.createServer(handleRequest);
+});
 
 server.listen(port, "127.0.0.1", () => {
-  console.log(`mock-openai listening on ${port} (${tlsCertPath ? "HTTPS" : "HTTP"})`);
+  console.log(`mock-openai listening on ${port}`);
 });

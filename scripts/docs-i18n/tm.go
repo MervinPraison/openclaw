@@ -19,6 +19,8 @@ type TMEntry struct {
 	TextHash   string `json:"text_hash"`
 	Text       string `json:"text"`
 	Translated string `json:"translated"`
+	Provider   string `json:"provider"`
+	Model      string `json:"model"`
 	SrcLang    string `json:"src_lang"`
 	TgtLang    string `json:"tgt_lang"`
 	UpdatedAt  string `json:"updated_at"`
@@ -38,9 +40,7 @@ func LoadTranslationMemory(path string) (*TranslationMemory, error) {
 		}
 		return nil, err
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	defer file.Close()
 
 	reader := bufio.NewReader(file)
 	for {

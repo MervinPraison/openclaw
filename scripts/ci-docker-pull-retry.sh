@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
-# shellcheck source=scripts/lib/host-timeout.sh
-source "$SCRIPT_DIR/lib/host-timeout.sh"
-
 if [[ "$#" -ne 1 || -z "${1// }" ]]; then
   echo "usage: $0 <image>" >&2
   exit 2
@@ -32,15 +28,14 @@ fi
 
 last_status=1
 run_docker_pull() {
-  local timeout_bin
-  if ! timeout_bin="$(openclaw_host_timeout_bin)"; then
-    echo "timeout or gtimeout command not found; cannot bound Docker pull after ${timeout_seconds}s" >&2
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "timeout command not found; cannot bound Docker pull after ${timeout_seconds}s" >&2
     return 127
   fi
-  if "$timeout_bin" --kill-after=1s 1s true >/dev/null 2>&1; then
-    "$timeout_bin" --kill-after=30s "${timeout_seconds}s" docker pull "$image"
+  if timeout --kill-after=1s 1s true >/dev/null 2>&1; then
+    timeout --kill-after=30s "${timeout_seconds}s" docker pull "$image"
   else
-    "$timeout_bin" "${timeout_seconds}s" docker pull "$image"
+    timeout "${timeout_seconds}s" docker pull "$image"
   fi
 }
 

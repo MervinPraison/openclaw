@@ -1,4 +1,15 @@
 [
+  "agent-runtime",
   "channel-lifecycle",
-  "infra-runtime"
+  "channel-runtime",
+  "cli-runtime",
+  "compat",
+  "config-types",
+  "conversation-runtime",
+  "hook-runtime",
+  "infra-runtime",
+  "media-runtime",
+  "plugin-runtime",
+  "security-runtime",
+  "text-runtime"
 ]

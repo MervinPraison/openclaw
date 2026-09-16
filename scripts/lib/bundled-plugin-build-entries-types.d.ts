@@ -3,7 +3,6 @@ export type BundledPluginBuildEntry = {
   id: string;
   hasPackageJson: boolean;
   packageJson: unknown;
-  catalogSourceEntries: string[];
   sourceEntries: string[];
 };
 
@@ -14,14 +13,6 @@ export type BundledPluginBuildEntryParams = {
 };
 
 export const NON_PACKAGED_BUNDLED_PLUGIN_DIRS: Set<string>;
-export const DOCKER_SELECTED_PLUGIN_BUILD_IDS_ENV: string;
-export function parseDockerSelectedPluginBuildIdFilter(env?: NodeJS.ProcessEnv): Set<string> | null;
-export function collectPluginSourceEntries(packageJson: unknown): string[];
-export function collectPluginDeclarationSourceEntries(
-  packageJson: unknown,
-  sourceEntries: string[],
-): string[];
-export function collectTopLevelPublicSurfaceEntries(pluginDir: string): string[];
 export function collectRootPackageExcludedExtensionDirs(
   params?: BundledPluginBuildEntryParams,
 ): Set<string>;

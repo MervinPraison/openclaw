@@ -1,8 +1,7 @@
 // Check Temp Path Guardrails script supports OpenClaw repository automation.
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import pMap, { pMapSkip } from "p-map";
-import { listRepoFilesSync } from "./check-file-utils.js";
 
 type QuoteChar = "'" | '"' | "`";
 
@@ -75,7 +74,7 @@ function findMatchingParen(source: string, openIndex: number): number {
   let depth = 1;
   const quoteState: QuoteScanState = { quote: null, escaped: false };
   for (let i = openIndex + 1; i < source.length; i += 1) {
-    const ch = source.charAt(i);
+    const ch = source[i];
     if (consumeQuotedChar(quoteState, ch)) {
       continue;
     }
@@ -193,8 +192,7 @@ function hasDynamicTmpdirJoin(source: string): boolean {
       if (closeParenIndex !== -1) {
         const argsSource = scanSource.slice(openParenIndex + 1, closeParenIndex);
         const args = splitTopLevelArguments(argsSource);
-        const firstArg = args[0];
-        if (firstArg && isOsTmpdirExpression(firstArg)) {
+        if (args.length >= 2 && isOsTmpdirExpression(args[0])) {
           for (const arg of args.slice(1)) {
             const trimmed = arg.trim();
             if (trimmed.startsWith("`") && trimmed.includes("${")) {
@@ -210,33 +208,58 @@ function hasDynamicTmpdirJoin(source: string): boolean {
 }
 
 function listTrackedRuntimeSourceFiles(repoRoot: string): string[] {
-  return listRepoFilesSync(repoRoot, {
-    roots: ["src", "extensions"],
-    includeFile: (relativePath) =>
-      (relativePath.endsWith(".ts") || relativePath.endsWith(".tsx")) &&
-      !shouldSkipGuardrailRuntimeSource(relativePath),
-  }).map((relativePath) => path.join(repoRoot, relativePath));
+  const stdout = execFileSync("git", ["-C", repoRoot, "ls-files", "--", "src", "extensions"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  return stdout
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .filter((relativePath) => relativePath.endsWith(".ts") || relativePath.endsWith(".tsx"))
+    .filter((relativePath) => !shouldSkipGuardrailRuntimeSource(relativePath))
+    .map((relativePath) => path.join(repoRoot, relativePath));
 }
 
 async function readRuntimeSourceFiles(
   repoRoot: string,
   absolutePaths: string[],
 ): Promise<RuntimeSourceGuardrailFile[]> {
-  return await pMap(
-    absolutePaths,
-    async (absolutePath) => {
+  const output: Array<RuntimeSourceGuardrailFile | undefined> = Array.from({
+    length: absolutePaths.length,
+  });
+  let nextIndex = 0;
+
+  const worker = async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= absolutePaths.length) {
+        return;
+      }
+      const absolutePath = absolutePaths[index];
+      if (!absolutePath) {
+        continue;
+      }
+      let source: string;
       try {
-        return {
-          relativePath: path.relative(repoRoot, absolutePath),
-          source: await fs.readFile(absolutePath, "utf8"),
-        };
+        source = await fs.readFile(absolutePath, "utf8");
       } catch {
         // File tracked by git but deleted on disk (e.g. pending deletion).
-        return pMapSkip;
+        continue;
       }
-    },
-    { concurrency: FILE_READ_CONCURRENCY, stopOnError: false },
+      output[index] = {
+        relativePath: path.relative(repoRoot, absolutePath),
+        source,
+      };
+    }
+  };
+
+  const workers = Array.from(
+    { length: Math.min(FILE_READ_CONCURRENCY, Math.max(1, absolutePaths.length)) },
+    () => worker(),
   );
+  await Promise.all(workers);
+  return output.filter((entry): entry is RuntimeSourceGuardrailFile => entry !== undefined);
 }
 
 async function main() {

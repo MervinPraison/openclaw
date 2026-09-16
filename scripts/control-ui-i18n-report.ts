@@ -18,11 +18,9 @@ const LOCALE_LABELS: Record<string, string> = {
   it: "Italian",
   "ja-JP": "Japanese",
   ko: "Korean",
-  hi: "Hindi",
   nl: "Dutch",
   pl: "Polish",
   "pt-BR": "Brazilian Portuguese",
-  ru: "Russian",
   th: "Thai",
   tr: "Turkish",
   uk: "Ukrainian",
@@ -82,13 +80,13 @@ type ReportArgs = {
   top: number;
 };
 
-type RawCopySummary = {
+export type RawCopySummary = {
   entries: number;
   occurrences: number;
   topPaths: Array<{ count: number; path: string }>;
 };
 
-type LocaleSummary = {
+export type LocaleSummary = {
   fallbackKeysInScope: string[];
   meta: LocaleMeta;
 };
@@ -130,7 +128,7 @@ export function parseArgs(argv: string[]): ReportArgs {
 
 function readOptionValue(argv: string[], index: number, flag: string) {
   const value = argv[index];
-  if (!value || value.startsWith("-")) {
+  if (!value || value.startsWith("--")) {
     throw new Error(`${flag} requires a value`);
   }
   return value;
