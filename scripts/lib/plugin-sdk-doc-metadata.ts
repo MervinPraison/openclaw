@@ -12,8 +12,8 @@ type PluginSdkDocMetadata = {
 };
 
 export const pluginSdkDocMetadata = {
-  "control-ui-link-reader": {
-    category: "core",
+  index: {
+    category: "legacy",
   },
   core: {
     category: "core",
@@ -33,10 +33,10 @@ export const pluginSdkDocMetadata = {
   "approval-delivery-runtime": {
     category: "runtime",
   },
-  "approval-gateway-runtime": {
+  "approval-native-runtime": {
     category: "runtime",
   },
-  "approval-native-runtime": {
+  "approval-reaction-runtime": {
     category: "runtime",
   },
   "approval-reply-runtime": {
@@ -45,16 +45,28 @@ export const pluginSdkDocMetadata = {
   "plugin-entry": {
     category: "core",
   },
+  "access-groups": {
+    category: "channel",
+  },
   "channel-actions": {
     category: "channel",
   },
   "channel-config-schema": {
     category: "channel",
   },
+  "channel-config-schema-legacy": {
+    category: "channel",
+  },
+  "chat-channel-ids": {
+    category: "channel",
+  },
   "channel-contract": {
     category: "channel",
   },
   "channel-pairing": {
+    category: "channel",
+  },
+  "channel-ingress": {
     category: "channel",
   },
   "channel-ingress-runtime": {
@@ -66,14 +78,17 @@ export const pluginSdkDocMetadata = {
   "channel-setup": {
     category: "channel",
   },
-  "channel-dm-policy": {
+  "command-auth": {
     category: "channel",
   },
-  "command-auth": {
+  zalouser: {
     category: "channel",
   },
   "command-status": {
     category: "channel",
+  },
+  "command-status-runtime": {
+    category: "runtime",
   },
   "secret-input": {
     category: "channel",
@@ -81,35 +96,38 @@ export const pluginSdkDocMetadata = {
   "webhook-ingress": {
     category: "channel",
   },
-  "widget-html": {
-    category: "utilities",
+  "provider-onboard": {
+    category: "provider",
+  },
+  "provider-oauth-runtime": {
+    category: "provider",
+  },
+  "provider-selection-runtime": {
+    category: "provider",
+  },
+  "provider-catalog-live-runtime": {
+    category: "provider",
   },
   "runtime-store": {
     category: "runtime",
   },
-  "plugin-command-runtime": {
-    category: "runtime",
-  },
-  "session-store-runtime": {
-    category: "runtime",
-  },
-  "conversation-binding-inspection-runtime": {
-    category: "runtime",
-  },
-  "agent-scope-runtime": {
-    category: "runtime",
+  "qa-live-transport-scenarios": {
+    category: "utilities",
   },
   "agent-runtime": {
     category: "runtime",
   },
-  "agent-harness-runtime": {
-    category: "runtime",
-  },
-  "agent-workspace-runtime": {
-    category: "runtime",
-  },
-  "speech-settings": {
+  "speech-core": {
     category: "provider",
+  },
+  "realtime-voice": {
+    category: "provider",
+  },
+  "tts-runtime": {
+    category: "runtime",
+  },
+  "inline-image-data-url-runtime": {
+    category: "runtime",
   },
   "allow-from": {
     category: "utilities",
@@ -117,9 +135,10 @@ export const pluginSdkDocMetadata = {
   "reply-payload": {
     category: "utilities",
   },
-  "media-local-roots": {
-    category: "utilities",
-  },
 } as const satisfies Record<string, PluginSdkDocMetadata>;
 
 export type PluginSdkDocEntrypoint = keyof typeof pluginSdkDocMetadata;
+
+export function resolvePluginSdkDocImportSpecifier(entrypoint: PluginSdkDocEntrypoint): string {
+  return entrypoint === "index" ? "openclaw/plugin-sdk" : `openclaw/plugin-sdk/${entrypoint}`;
+}

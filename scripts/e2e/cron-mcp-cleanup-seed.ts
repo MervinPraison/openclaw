@@ -72,6 +72,7 @@ async function main() {
     {
       gateway: {
         controlUi: {
+          allowInsecureAuth: true,
           enabled: false,
         },
       },

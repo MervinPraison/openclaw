@@ -1,6 +1,5 @@
 // Telegram Bot Api script supports OpenClaw repository automation.
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { readBoundedResponseText } from "../lib/bounded-response.mjs";
+import { readBoundedResponseText } from "../lib/bounded-response.ts";
 import { readPositiveIntEnv } from "./lib/env-limits.mjs";
 
 type JsonObject = Record<string, unknown>;
@@ -14,7 +13,7 @@ type TelegramBotApiOptions = {
 
 const DEFAULT_BASE_URL =
   process.env.OPENCLAW_TELEGRAM_USER_BOT_API_BASE_URL ?? "https://api.telegram.org";
-type TelegramBotApiLimits = {
+export type TelegramBotApiLimits = {
   bodyMaxBytes: number;
   timeoutMs: number;
 };
@@ -33,6 +32,11 @@ export function readTelegramBotApiLimits(
 }
 
 const DEFAULT_LIMITS = readTelegramBotApiLimits();
+
+function optionalString(source: JsonObject, key: string) {
+  const value = source[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
 
 function taggedError(message: string, code: string) {
   return Object.assign(new Error(message), { code });
@@ -86,8 +90,7 @@ export async function telegramBotApi(
     const payload = parseJsonPayload(rawPayload, label);
     if (!response.ok || payload.ok !== true) {
       throw new Error(
-        normalizeOptionalString(payload.description) ??
-          `${method} failed with HTTP ${response.status}`,
+        optionalString(payload, "description") ?? `${method} failed with HTTP ${response.status}`,
       );
     }
     return payload.result;

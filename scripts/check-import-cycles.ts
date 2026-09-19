@@ -50,14 +50,8 @@ function createSourceResolver(files: readonly string[]) {
       return null;
     }
     const base = path.posix.normalize(path.posix.join(path.posix.dirname(importer), specifier));
-    if (fileSet.has(base)) {
-      return base;
-    }
-    const mappedBase = pathMap.get(base);
-    if (mappedBase) {
-      return mappedBase;
-    }
     const candidates = [
+      base,
       ...sourceExtensions.map((extension) => `${base}${extension}`),
       `${base}/index.ts`,
       `${base}/index.tsx`,
@@ -110,7 +104,7 @@ function collectRuntimeStaticImports(
     file,
     readFileSync(path.join(repoRoot, file), "utf8"),
     ts.ScriptTarget.Latest,
-    false,
+    true,
   );
   const imports: string[] = [];
   const visit = (node: ts.Node) => {

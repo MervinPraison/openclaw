@@ -3,25 +3,16 @@
 
 import { pathToFileURL } from "node:url";
 import {
-  assertPluginReleaseDependencyFreshness,
   collectClawHubPublishablePluginPackages,
   collectClawHubVersionGateErrors,
   assertPluginReleaseVersionFloors,
   parsePluginReleaseArgs,
   resolveSelectedClawHubPublishablePluginPackages,
 } from "./lib/plugin-clawhub-release.ts";
-import type { NpmLatestVersionResolver } from "./lib/plugin-npm-release.ts";
 
-export async function runPluginClawHubReleaseCheck(
-  argv: string[],
-  options: {
-    rootDir?: string;
-    resolveLatestVersion?: NpmLatestVersionResolver;
-  } = {},
-) {
+export async function runPluginClawHubReleaseCheck(argv: string[]) {
   const { selection, selectionMode, baseRef, headRef } = parsePluginReleaseArgs(argv);
-  const rootDir = options.rootDir ?? ".";
-  const publishable = collectClawHubPublishablePluginPackages(rootDir, {
+  const publishable = collectClawHubPublishablePluginPackages(".", {
     packageNames:
       selectionMode === "all-publishable" || selection.length === 0 ? undefined : selection,
   });
@@ -31,23 +22,16 @@ export async function runPluginClawHubReleaseCheck(
     selection,
     selectionMode,
     gitRange,
-    rootDir,
   });
 
   if (selectionMode !== undefined || selection.length > 0) {
     assertPluginReleaseVersionFloors(selected, "plugin-clawhub-release-check");
   }
-  assertPluginReleaseDependencyFreshness(
-    selected,
-    "plugin-clawhub-release-check",
-    options.resolveLatestVersion,
-  );
 
   if (gitRange) {
     const errors = collectClawHubVersionGateErrors({
       plugins: publishable,
       gitRange,
-      rootDir,
     });
     if (errors.length > 0) {
       throw new Error(

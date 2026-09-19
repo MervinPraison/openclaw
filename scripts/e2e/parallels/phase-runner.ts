@@ -2,11 +2,9 @@
 import { appendFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { clampTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
-import { tailText } from "../lib/text-file-utils.mjs";
 import { say, warn } from "./host-command.ts";
 
-const PHASE_LOG_TAIL_MAX_BYTES = 512 * 1024;
+export const PHASE_LOG_TAIL_MAX_BYTES = 512 * 1024;
 
 function appendTextTail(current: string, chunk: string, maxBytes: number): string {
   const text = chunk.endsWith("\n") ? chunk : `${chunk}\n`;
@@ -16,20 +14,14 @@ function appendTextTail(current: string, chunk: string, maxBytes: number): strin
   }
   const marker = `[phase log tail truncated to last ${maxBytes} bytes]\n`;
   const tailBytes = Math.max(0, maxBytes - Buffer.byteLength(marker));
-  // tailText owns the UTF-8-safe byte truncation; the marker keeps the tail self-describing.
-  return `${marker}${tailText(combined, tailBytes)}`;
-}
-
-function resolvePhaseTimeoutMs(timeoutSeconds: number): number {
-  return clampTimerTimeoutMs(timeoutSeconds * 1000) ?? 1;
+  const tail = Buffer.from(combined).subarray(-tailBytes).toString("utf8");
+  return `${marker}${tail}`;
 }
 
 export class PhaseRunner {
   private logTail = "";
   private currentLogPath: string | undefined;
   private deadlineMs = 0;
-  private runDir: string;
-  private logTailMaxBytes: number;
   private timings: Array<{
     durationMs: number;
     logPath: string;
@@ -38,18 +30,17 @@ export class PhaseRunner {
     timeoutSeconds: number;
   }> = [];
 
-  constructor(runDir: string, logTailMaxBytes = PHASE_LOG_TAIL_MAX_BYTES) {
-    this.runDir = runDir;
-    this.logTailMaxBytes = logTailMaxBytes;
-  }
+  constructor(
+    private runDir: string,
+    private logTailMaxBytes = PHASE_LOG_TAIL_MAX_BYTES,
+  ) {}
 
   async phase(name: string, timeoutSeconds: number, fn: () => Promise<void> | void): Promise<void> {
     const logPath = path.join(this.runDir, `${name}.log`);
-    const timeoutMs = resolvePhaseTimeoutMs(timeoutSeconds);
     say(name);
     this.logTail = "";
     this.currentLogPath = logPath;
-    this.deadlineMs = Date.now() + timeoutMs;
+    this.deadlineMs = Date.now() + timeoutSeconds * 1000;
     await writeFile(logPath, "", "utf8");
     const startedAt = Date.now();
     let status: "pass" | "fail" = "fail";
@@ -57,7 +48,7 @@ export class PhaseRunner {
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(
         () => reject(new Error(`${name} timed out after ${timeoutSeconds}s`)),
-        timeoutMs,
+        timeoutSeconds * 1000,
       );
     });
     try {

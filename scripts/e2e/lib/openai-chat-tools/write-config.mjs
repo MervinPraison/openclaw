@@ -1,12 +1,23 @@
 // Config writer for OpenAI chat tools E2E scenarios.
 import fs from "node:fs";
 import path from "node:path";
-import { readPositiveIntEnv, readTcpPortEnv } from "../env-limits.mjs";
 
 function requireEnv(name) {
   const value = process.env[name];
   if (!value) {
     throw new Error(`missing ${name}`);
+  }
+  return value;
+}
+
+function readPositiveIntEnv(name, fallback) {
+  const text = String(process.env[name] ?? fallback).trim();
+  if (!/^\d+$/u.test(text)) {
+    throw new Error(`invalid ${name}: ${text}`);
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`invalid ${name}: ${text}`);
   }
   return value;
 }
@@ -17,7 +28,7 @@ const workspaceDir = requireEnv("OPENCLAW_TEST_WORKSPACE_DIR");
 const modelRef = requireEnv("OPENCLAW_OPENAI_CHAT_TOOLS_MODEL");
 const token = requireEnv("OPENCLAW_GATEWAY_TOKEN");
 const timeoutSeconds = readPositiveIntEnv("OPENCLAW_OPENAI_CHAT_TOOLS_TIMEOUT_SECONDS", 180);
-const gatewayPort = readTcpPortEnv("PORT", 18789);
+const gatewayPort = readPositiveIntEnv("PORT", 18789);
 const [providerId, modelId] = modelRef.split("/");
 if (providerId !== "openai" || !modelId) {
   throw new Error(`OPENCLAW_OPENAI_CHAT_TOOLS_MODEL must be openai/*, got ${modelRef}`);
@@ -83,21 +94,6 @@ const config = {
   skills: { allowBundled: [] },
   tools: { allow: ["get_weather"] },
 };
-
-const coldStorageMode = process.env.OPENCLAW_FROZEN_TARGET_SESSION_COLD_STORAGE_MODE ?? "required";
-if (coldStorageMode === "required") {
-  config.session = {
-    maintenance: {
-      mode: "warn",
-      pruneAfter: "3650d",
-      archiveDashboardAfter: false,
-      maxDiskBytes: false,
-      coldStorage: { enabled: true, afterDays: 30 },
-    },
-  };
-} else if (coldStorageMode !== "unsupported") {
-  throw new Error("invalid frozen session cold-storage mode");
-}
 
 fs.mkdirSync(path.dirname(configPath), { recursive: true });
 fs.mkdirSync(workspaceDir, { recursive: true });
