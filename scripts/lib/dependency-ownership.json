@@ -11,21 +11,6 @@
       "class": "default-runtime-initially",
       "risk": ["provider-sdk", "network"]
     },
-    "@babel/generator": {
-      "owner": "core:plugin-loader",
-      "class": "core-runtime",
-      "risk": ["compiler-api"]
-    },
-    "@babel/parser": {
-      "owner": "core:typescript-analysis",
-      "class": "core-runtime",
-      "risk": ["parser", "compiler-api"]
-    },
-    "@babel/traverse": {
-      "owner": "core:typescript-analysis",
-      "class": "core-runtime",
-      "risk": ["compiler-api"]
-    },
     "@clack/core": {
       "owner": "core:cli",
       "class": "core-runtime",
@@ -82,32 +67,10 @@
       "class": "default-runtime-initially",
       "risk": ["provider-sdk", "network"]
     },
-    "@openclaw/ai": {
-      "owner": "core:ai-runtime",
-      "class": "core-runtime",
-      "risk": ["provider-routing", "model-io"]
-    },
     "@openclaw/fs-safe": {
       "owner": "core:filesystem-safety",
       "class": "core-runtime",
       "risk": ["filesystem", "path-safety"]
-    },
-    "@silvia-odwyer/photon-node": {
-      "owner": "core:media",
-      "class": "core-runtime",
-      "activation": ["agent.tool.read.image.bmp"],
-      "risk": ["wasm", "parser", "untrusted-files"]
-    },
-    "@trycua/cua-driver": {
-      "owner": "plugin:cua-computer",
-      "class": "plugin-runtime",
-      "activation": ["plugins.entries.cua-computer.enabled"],
-      "risk": ["native", "computer-control"]
-    },
-    "acorn": {
-      "owner": "core:code-mode-and-release-verification",
-      "class": "core-runtime",
-      "risk": ["parser", "untrusted-javascript"]
     },
     "chalk": {
       "owner": "core:cli",
@@ -119,15 +82,15 @@
       "class": "core-runtime",
       "risk": ["filesystem-watch"]
     },
-    "chrome-devtools-mcp": {
-      "owner": "plugin:browser",
-      "class": "plugin-runtime",
-      "risk": ["browser-control", "protocol-client"]
-    },
     "commander": {
       "owner": "core:cli",
       "class": "core-runtime",
       "risk": ["cli-parser"]
+    },
+    "cross-spawn": {
+      "owner": "core:child-process",
+      "class": "core-runtime",
+      "risk": ["process-spawn"]
     },
     "croner": {
       "owner": "core:scheduler",
@@ -144,21 +107,6 @@
       "class": "core-runtime",
       "risk": ["env-loading"]
     },
-    "entities": {
-      "owner": "core:html-entities",
-      "class": "core-runtime",
-      "risk": ["parser", "untrusted-html"]
-    },
-    "esbuild": {
-      "owner": "core:plugin-loader",
-      "class": "core-runtime",
-      "risk": ["native", "compiler-api"]
-    },
-    "execa": {
-      "owner": "core:process-execution",
-      "class": "core-runtime",
-      "risk": ["process-execution", "large-transitive-cone"]
-    },
     "express": {
       "owner": "capability:http-route-host",
       "class": "default-runtime-initially",
@@ -168,6 +116,11 @@
       "owner": "core:media-admission",
       "class": "core-runtime",
       "risk": ["file-sniffing", "untrusted-files"]
+    },
+    "glob": {
+      "owner": "core:package-manager",
+      "class": "core-runtime",
+      "risk": ["filesystem-glob"]
     },
     "grammy": {
       "owner": "plugin:telegram",
@@ -184,11 +137,6 @@
       "class": "core-runtime",
       "risk": ["git-metadata-parser"]
     },
-    "iconv-lite": {
-      "owner": "core:windows-launcher",
-      "class": "core-runtime",
-      "risk": ["encoding", "windows-launcher"]
-    },
     "ignore": {
       "owner": "core:gitignore-matching",
       "class": "core-runtime",
@@ -198,11 +146,6 @@
       "owner": "core:proxy",
       "class": "core-runtime",
       "risk": ["network", "proxy"]
-    },
-    "import-meta-resolve": {
-      "owner": "core:plugin-loader",
-      "class": "core-runtime",
-      "risk": ["module-resolution"]
     },
     "jiti": {
       "owner": "core:plugin-loader",
@@ -219,11 +162,6 @@
       "class": "core-runtime",
       "risk": ["archive-parser", "untrusted-files"]
     },
-    "koffi": {
-      "owner": "core:process-execution",
-      "class": "core-runtime",
-      "risk": ["native", "ffi", "process-execution", "secret-input"]
-    },
     "kysely": {
       "owner": "core:sqlite-storage",
       "class": "core-runtime",
@@ -235,15 +173,15 @@
       "activation": ["tools.web.fetch.readability", "plugins.entries.web-readability.enabled"],
       "risk": ["parser", "untrusted-html"]
     },
+    "markdown-it": {
+      "owner": "core:markdown-rendering",
+      "class": "core-runtime",
+      "risk": ["parser", "markdown"]
+    },
     "minimatch": {
       "owner": "core:pattern-matching",
       "class": "core-runtime",
       "risk": ["pattern-matching"]
-    },
-    "ms": {
-      "owner": "core:duration-parsing",
-      "class": "core-runtime",
-      "risk": ["duration-parser"]
     },
     "node-edge-tts": {
       "owner": "plugin:microsoft",
@@ -255,16 +193,6 @@
       "class": "default-runtime-initially",
       "risk": ["provider-sdk", "network"]
     },
-    "p-limit": {
-      "owner": "core:concurrency",
-      "class": "core-runtime",
-      "risk": ["concurrency"]
-    },
-    "p-map": {
-      "owner": "core:concurrency",
-      "class": "core-runtime",
-      "risk": ["concurrency"]
-    },
     "partial-json": {
       "owner": "core:llm-json-parsing",
       "class": "core-runtime",
@@ -275,15 +203,14 @@
       "class": "core-runtime",
       "risk": ["browser-automation", "cdp"]
     },
-    "pretty-ms": {
-      "owner": "core:duration-formatting",
+    "proper-lockfile": {
+      "owner": "core:session-storage",
       "class": "core-runtime",
-      "risk": ["formatting"]
+      "risk": ["filesystem-locking"]
     },
     "quickjs-wasi": {
-      "owner": "plugin:code-mode-quickjs",
-      "class": "plugin-runtime",
-      "activation": ["tools.codeMode.executor.quickjs"],
+      "owner": "core:code-mode",
+      "class": "core-runtime",
       "risk": ["wasm", "sandboxed-js"]
     },
     "clawpdf": {
@@ -302,11 +229,6 @@
       "class": "core-runtime",
       "risk": ["wasm", "parser", "untrusted-files", "native-tool-fallback"]
     },
-    "semver": {
-      "owner": "core:versioning",
-      "class": "core-runtime",
-      "risk": ["version-parser"]
-    },
     "sqlite-vec": {
       "owner": "capability:memory-sqlite-vec",
       "class": "default-runtime-initially",
@@ -317,10 +239,20 @@
       "class": "core-runtime",
       "risk": ["archive-parser", "untrusted-files"]
     },
+    "tree-sitter-bash": {
+      "owner": "core:command-explainer",
+      "class": "core-runtime",
+      "risk": ["wasm", "parser", "untrusted-shell"]
+    },
     "tslog": {
       "owner": "core:logging",
       "class": "core-runtime",
       "risk": ["logging"]
+    },
+    "typescript": {
+      "owner": "core:typescript-analysis",
+      "class": "core-runtime",
+      "risk": ["compiler-api"]
     },
     "typebox": {
       "owner": "core:json-schema-contracts",

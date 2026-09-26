@@ -1,7 +1,7 @@
-// Scans packaged JavaScript for relative imports and missing closure entries.
+// Scans packaged dist JavaScript for relative imports and missing closure entries.
 import path from "node:path";
-import { visitJavaScriptStatements } from "./javascript-statements.mjs";
-const JS_FILE_RE = /\.(?:cjs|js|mjs)$/u;
+
+const JS_DIST_FILE_RE = /^dist\/.*\.(?:cjs|js|mjs)$/u;
 
 function normalizePackagePath(value) {
   return value.replace(/\\/gu, "/").replace(/^package\//u, "");
@@ -11,99 +11,105 @@ function stripSpecifierSuffix(value) {
   return value.replace(/[?#].*$/u, "");
 }
 
-function hasJavaScriptFileExtension(value) {
-  return /\.(?:cjs|js|mjs)$/u.test(path.posix.basename(stripSpecifierSuffix(value)));
+function resolveDistImportPath(importerPath, specifier) {
+  if (!specifier.startsWith(".")) {
+    return null;
+  }
+  const stripped = stripSpecifierSuffix(specifier);
+  if (!stripped) {
+    return null;
+  }
+  return path.posix.normalize(path.posix.join(path.posix.dirname(importerPath), stripped));
 }
 
-function literal(node) {
-  if (node?.type === "Literal" && typeof node.value === "string") {
-    return node.value;
-  }
-  return node?.type === "TemplateLiteral" && node.expressions.length === 0
-    ? node.quasis[0].value.cooked
-    : undefined;
-}
-
-function appendImportEdges(source, importerPath, imports) {
-  function visit(node) {
-    let kind;
-    let specifier;
-    if (
-      ["ImportDeclaration", "ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type)
-    ) {
-      specifier = literal(node.source);
-    } else if (node.type === "ImportExpression") {
-      specifier = literal(node.source);
-    } else if (
-      node.type === "CallExpression" &&
-      node.callee.type === "Identifier" &&
-      node.callee.name === "require"
-    ) {
-      specifier = literal(node.arguments[0]);
-    } else if (
-      node.type === "NewExpression" &&
-      node.callee.type === "Identifier" &&
-      node.callee.name === "URL" &&
-      node.arguments.length >= 2
-    ) {
-      const base = node.arguments[1];
-      if (
-        base.type === "MemberExpression" &&
-        !base.computed &&
-        base.property.type === "Identifier" &&
-        base.property.name === "url" &&
-        base.object.type === "MetaProperty" &&
-        base.object.meta.name === "import" &&
-        base.object.property.name === "meta"
-      ) {
-        kind = "import-meta-url";
-        specifier = literal(node.arguments[0]);
-      }
-    }
-    if (
-      specifier?.startsWith(".") &&
-      (kind !== "import-meta-url" || hasJavaScriptFileExtension(specifier))
-    ) {
-      const importedPath = path.posix.normalize(
-        path.posix.join(path.posix.dirname(importerPath), stripSpecifierSuffix(specifier)),
-      );
-      // stageManagedHandoffRuntime copies this entry and stages its private Koffi
-      // closure before launch; this URL belongs to that runtime, not the tarball.
-      const stagedNativeUrl =
-        kind === "import-meta-url" &&
-        importerPath === "dist/managed-handoff-runtime.mjs" &&
-        importedPath === "dist/node_modules/koffi/indirect.cjs";
-      if (!stagedNativeUrl && (kind !== "import-meta-url" || importedPath.startsWith("dist/"))) {
-        imports.push({ importerPath, importedPath });
-      }
-    }
-    for (const value of Object.values(node)) {
-      if (Array.isArray(value)) {
-        for (const child of value) {
-          if (child && typeof child.type === "string") {
-            visit(child);
-          }
-        }
-      } else if (value && typeof value.type === "string") {
-        visit(value);
-      }
-    }
-  }
-  visitJavaScriptStatements(
-    source,
-    {
-      sourceType: importerPath.endsWith(".cjs") ? "script" : "module",
-      allowReturnOutsideFunction: true,
-    },
-    (statements) => {
-      for (const statement of statements) {
-        visit(statement);
-      }
-    },
+function findStatementStart(source, index) {
+  return (
+    Math.max(
+      source.lastIndexOf(";", index),
+      source.lastIndexOf("{", index),
+      source.lastIndexOf("}", index),
+      source.lastIndexOf("\n", index),
+      source.lastIndexOf("\r", index),
+    ) + 1
   );
 }
 
-/** Collect missing-file errors for relative imports inside package files. */
+function isImportSpecifierContext(source, index) {
+  const dynamicPrefix = source.slice(Math.max(0, index - 32), index);
+  if (/\bimport\s*\(\s*$/u.test(dynamicPrefix)) {
+    return true;
+  }
+  const statementPrefix = source.slice(findStatementStart(source, index), index).trimStart();
+  return (
+    /^(?:import|export)\b[\s\S]*\bfrom\s*$/u.test(statementPrefix) ||
+    /^import\s*$/u.test(statementPrefix)
+  );
+}
+
+function collectImportSpecifiers(source) {
+  const specifiers = [];
+  let inBlockComment = false;
+  let inLineComment = false;
+  for (let index = 0; index < source.length; index += 1) {
+    if (inBlockComment) {
+      if (source[index] === "*" && source[index + 1] === "/") {
+        inBlockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (inLineComment) {
+      if (source[index] === "\n" || source[index] === "\r") {
+        inLineComment = false;
+      }
+      continue;
+    }
+    if (source[index] === "/" && source[index + 1] === "*") {
+      inBlockComment = true;
+      index += 1;
+      continue;
+    }
+    if (source[index] === "/" && source[index + 1] === "/") {
+      inLineComment = true;
+      index += 1;
+      continue;
+    }
+
+    const quote = source[index];
+    if (quote !== '"' && quote !== "'") {
+      continue;
+    }
+
+    let cursor = index + 1;
+    let value = "";
+    while (cursor < source.length) {
+      const char = source[cursor];
+      if (char === "\\") {
+        value += source.slice(cursor, cursor + 2);
+        cursor += 2;
+        continue;
+      }
+      if (char === quote) {
+        break;
+      }
+      value += char;
+      cursor += 1;
+    }
+    if (cursor >= source.length) {
+      break;
+    }
+
+    if (value.startsWith(".")) {
+      if (isImportSpecifierContext(source, index)) {
+        specifiers.push(value);
+      }
+    }
+    index = cursor;
+  }
+  return specifiers;
+}
+
+/** Collect missing-file errors for relative imports inside package dist files. */
 export function collectPackageDistImportErrors(params) {
   const files = [...new Set(params.files.map(normalizePackagePath))];
   const fileSet = new Set(files);
@@ -121,21 +127,48 @@ export function collectPackageDistImportErrors(params) {
 
 /** Collect relative dist import edges from package JavaScript files. */
 export function collectPackageDistImports(params) {
-  const files =
-    params.files.length === 1
-      ? [normalizePackagePath(params.files[0])]
-      : [...new Set(params.files.map(normalizePackagePath))].toSorted((left, right) =>
-          left.localeCompare(right),
-        );
+  const files = [...new Set(params.files.map(normalizePackagePath))];
   const imports = [];
 
-  for (const importerPath of files) {
-    if (!JS_FILE_RE.test(importerPath) || /(?:^|\/)node_modules\//u.test(importerPath)) {
+  for (const importerPath of files.toSorted((left, right) => left.localeCompare(right))) {
+    if (!JS_DIST_FILE_RE.test(importerPath) || importerPath.includes("/node_modules/")) {
       continue;
     }
     const source = params.readText(importerPath);
-    appendImportEdges(source, importerPath, imports);
+    for (const specifier of collectImportSpecifiers(source)) {
+      const importedPath = resolveDistImportPath(importerPath, specifier);
+      if (!importedPath) {
+        continue;
+      }
+      imports.push({ importerPath, importedPath });
+    }
   }
 
   return imports;
+}
+
+/** Expand seed dist files to include all reachable relative dist imports. */
+export function expandPackageDistImportClosure(params) {
+  const files = [...new Set(params.files.map(normalizePackagePath))];
+  const fileSet = new Set(files);
+  const expectedSet = new Set(params.seedFiles.map(normalizePackagePath));
+  const imports = params.imports ?? collectPackageDistImports({ files, readText: params.readText });
+  const importsByImporter = new Map();
+  for (const { importerPath, importedPath } of imports) {
+    const importerImports = importsByImporter.get(importerPath) ?? [];
+    importerImports.push(importedPath);
+    importsByImporter.set(importerPath, importerImports);
+  }
+
+  const queue = [...expectedSet].filter((file) => fileSet.has(file));
+  for (const importerPath of queue) {
+    for (const importedPath of importsByImporter.get(importerPath) ?? []) {
+      if (fileSet.has(importedPath) && !expectedSet.has(importedPath)) {
+        expectedSet.add(importedPath);
+        queue.push(importedPath);
+      }
+    }
+  }
+
+  return [...expectedSet].toSorted((left, right) => left.localeCompare(right));
 }

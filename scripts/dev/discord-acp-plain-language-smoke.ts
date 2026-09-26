@@ -8,7 +8,8 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { formatErrorMessage } from "../../src/infra/errors.ts";
-import { readBoundedResponseText } from "../lib/bounded-response.mjs";
+import { createPluginStateKeyedStore } from "../../src/plugin-state/plugin-state-store.ts";
+import { readBoundedResponseText } from "../lib/bounded-response.ts";
 import {
   maskIdentifier,
   parseStrictIntegerOption,
@@ -16,7 +17,6 @@ import {
   redactForDevToolLog,
   redactHomePath,
 } from "../lib/dev-tooling-safety.ts";
-import { sleep } from "../lib/sleep.mjs";
 
 function writeStdoutLine(message: string): void {
   process.stdout.write(`${message}\n`);
@@ -136,35 +136,17 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_OPENCLAW_CLI_TIMEOUT_MS = 60_000;
 const DISCORD_RESPONSE_BODY_MAX_BYTES = 1024 * 1024;
 const WEBHOOK_CLEANUP_TIMEOUT_MS = 10_000;
-const BOOLEAN_OPTIONS = new Set(["--help", "-h", "--json"]);
-const VALUE_OPTIONS = new Set([
-  "--channel",
-  "--driver",
-  "--token",
-  "--token-prefix",
-  "--bot-token",
-  "--bot-token-prefix",
-  "--agent",
-  "--mention",
-  "--instruction",
-  "--timeout-ms",
-  "--poll-ms",
-  "--state-dir",
-  "--openclaw-bin",
-]);
 
-class CliArgumentError extends Error {
-  override name = "CliArgumentError";
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
-function remainingTimeoutMs(
-  deadlineMs: number,
-  timeoutError?: () => Error,
-  nowMs = Date.now(),
-): number {
+function remainingTimeoutMs(deadlineMs: number, nowMs = Date.now()): number {
   const remaining = Math.floor(deadlineMs - nowMs);
   if (!Number.isFinite(deadlineMs) || remaining <= 0) {
-    throw timeoutError?.() ?? new Error("Discord ACP smoke exceeded total timeout.");
+    throw new Error("Discord ACP smoke exceeded total timeout.");
   }
   return Math.max(1, remaining);
 }
@@ -255,48 +237,21 @@ function resolveStateDir(): string {
   return path.join(home, ".openclaw");
 }
 
-function resolveArg(flag: string, argv: string[]): string | undefined {
+function resolveArg(flag: string): string | undefined {
+  const argv = process.argv.slice(2);
   const eq = argv.find((entry) => entry.startsWith(`${flag}=`));
   if (eq) {
-    const value = eq.slice(flag.length + 1);
-    if (!value) {
-      throw new CliArgumentError(`${flag} requires a value`);
-    }
-    return value;
+    return eq.slice(flag.length + 1);
   }
   const idx = argv.indexOf(flag);
-  if (idx < 0) {
-    return undefined;
+  if (idx >= 0 && idx + 1 < argv.length) {
+    return argv[idx + 1];
   }
-  const value = argv[idx + 1];
-  if (!value || value.startsWith("-")) {
-    throw new CliArgumentError(`${flag} requires a value`);
-  }
-  return value;
+  return undefined;
 }
 
-function hasFlag(flag: string, argv = process.argv.slice(2)): boolean {
-  return argv.includes(flag);
-}
-
-function validateCliArgs(argv: string[]): void {
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index] ?? "";
-    if (BOOLEAN_OPTIONS.has(arg)) {
-      continue;
-    }
-    if (arg.startsWith("--") && arg.includes("=")) {
-      const flag = arg.slice(0, arg.indexOf("="));
-      if (VALUE_OPTIONS.has(flag)) {
-        continue;
-      }
-    }
-    if (VALUE_OPTIONS.has(arg)) {
-      index += 1;
-      continue;
-    }
-    throw new CliArgumentError(`Unknown argument: ${arg}`);
-  }
+function hasFlag(flag: string): boolean {
+  return process.argv.slice(2).includes(flag);
 }
 
 function parseDriverMode(raw: string): DriverMode {
@@ -359,54 +314,43 @@ function usage(): string {
   );
 }
 
-function parseArgs(argv = process.argv.slice(2)): Args {
-  validateCliArgs(argv);
-  const channelId =
-    resolveArg("--channel", argv) || process.env.OPENCLAW_DISCORD_SMOKE_CHANNEL_ID || "";
+function parseArgs(): Args {
+  const channelId = resolveArg("--channel") || process.env.OPENCLAW_DISCORD_SMOKE_CHANNEL_ID || "";
   const driverModeRaw =
-    resolveArg("--driver", argv) || process.env.OPENCLAW_DISCORD_SMOKE_DRIVER || "token";
+    resolveArg("--driver") || process.env.OPENCLAW_DISCORD_SMOKE_DRIVER || "token";
   const driverMode = parseDriverMode(driverModeRaw);
   const driverToken =
-    resolveArg("--token", argv) || process.env.OPENCLAW_DISCORD_SMOKE_DRIVER_TOKEN || "";
+    resolveArg("--token") || process.env.OPENCLAW_DISCORD_SMOKE_DRIVER_TOKEN || "";
   const driverTokenPrefix =
-    resolveArg("--token-prefix", argv) ||
-    process.env.OPENCLAW_DISCORD_SMOKE_DRIVER_TOKEN_PREFIX ||
-    "Bot";
+    resolveArg("--token-prefix") || process.env.OPENCLAW_DISCORD_SMOKE_DRIVER_TOKEN_PREFIX || "Bot";
   const botToken =
-    resolveArg("--bot-token", argv) ||
+    resolveArg("--bot-token") ||
     process.env.OPENCLAW_DISCORD_SMOKE_BOT_TOKEN ||
     process.env.DISCORD_BOT_TOKEN ||
     "";
   const botTokenPrefix =
-    resolveArg("--bot-token-prefix", argv) ||
+    resolveArg("--bot-token-prefix") ||
     process.env.OPENCLAW_DISCORD_SMOKE_BOT_TOKEN_PREFIX ||
     "Bot";
-  const targetAgent =
-    resolveArg("--agent", argv) || process.env.OPENCLAW_DISCORD_SMOKE_AGENT || "codex";
+  const targetAgent = resolveArg("--agent") || process.env.OPENCLAW_DISCORD_SMOKE_AGENT || "codex";
   const mentionUserId =
-    resolveArg("--mention", argv) ||
-    process.env.OPENCLAW_DISCORD_SMOKE_MENTION_USER_ID ||
-    undefined;
+    resolveArg("--mention") || process.env.OPENCLAW_DISCORD_SMOKE_MENTION_USER_ID || undefined;
   const instruction =
-    resolveArg("--instruction", argv) ||
-    process.env.OPENCLAW_DISCORD_SMOKE_INSTRUCTION ||
-    undefined;
+    resolveArg("--instruction") || process.env.OPENCLAW_DISCORD_SMOKE_INSTRUCTION || undefined;
   const timeoutMs = parseNumber(
-    resolveArg("--timeout-ms", argv) || process.env.OPENCLAW_DISCORD_SMOKE_TIMEOUT_MS,
+    resolveArg("--timeout-ms") || process.env.OPENCLAW_DISCORD_SMOKE_TIMEOUT_MS,
     240_000,
     "--timeout-ms",
   );
   const pollMs = parseNumber(
-    resolveArg("--poll-ms", argv) || process.env.OPENCLAW_DISCORD_SMOKE_POLL_MS,
+    resolveArg("--poll-ms") || process.env.OPENCLAW_DISCORD_SMOKE_POLL_MS,
     1_500,
     "--poll-ms",
   );
-  const stateDir = path.resolve(resolveArg("--state-dir", argv) || resolveStateDir());
+  const stateDir = path.resolve(resolveArg("--state-dir") || resolveStateDir());
   const openclawBin =
-    resolveArg("--openclaw-bin", argv) ||
-    process.env.OPENCLAW_DISCORD_SMOKE_OPENCLAW_BIN ||
-    "openclaw";
-  const json = hasFlag("--json", argv);
+    resolveArg("--openclaw-bin") || process.env.OPENCLAW_DISCORD_SMOKE_OPENCLAW_BIN || "openclaw";
+  const json = hasFlag("--json");
 
   if (!channelId) {
     throw new Error(usage());
@@ -563,7 +507,7 @@ async function requestDiscordJson<T>(params: {
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     const controller = new AbortController();
-    const fetchTimeoutMs = remainingTimeoutMs(deadlineMs, timeoutError);
+    const fetchTimeoutMs = remainingTimeoutMs(deadlineMs);
     const response = await withTimeout({
       operation: fetchImpl(`${DISCORD_API_BASE}${params.path}`, {
         method: params.method,
@@ -577,7 +521,7 @@ async function requestDiscordJson<T>(params: {
     });
 
     if (response.status === 429) {
-      const bodyTimeoutMs = remainingTimeoutMs(deadlineMs, timeoutError);
+      const bodyTimeoutMs = remainingTimeoutMs(deadlineMs);
       const body = (await withTimeout({
         operation: readDiscordResponseJson({
           response,
@@ -596,7 +540,7 @@ async function requestDiscordJson<T>(params: {
       })) as { retry_after?: number };
       const waitSeconds = typeof body.retry_after === "number" ? body.retry_after : 1;
       const waitMs = Math.ceil(waitSeconds * 1000);
-      const remainingMs = remainingTimeoutMs(deadlineMs, timeoutError);
+      const remainingMs = remainingTimeoutMs(deadlineMs);
       if (waitMs >= remainingMs) {
         throw new Error(
           `${params.errorPrefix} ${params.method} ${redactDiscordApiPath(params.path)} exceeded total timeout before retry.`,
@@ -607,7 +551,7 @@ async function requestDiscordJson<T>(params: {
     }
 
     if (!response.ok) {
-      const bodyTimeoutMs = remainingTimeoutMs(deadlineMs, timeoutError);
+      const bodyTimeoutMs = remainingTimeoutMs(deadlineMs);
       const text = await withTimeout({
         operation: readDiscordResponseText({
           response,
@@ -630,7 +574,7 @@ async function requestDiscordJson<T>(params: {
       return undefined as T;
     }
 
-    const bodyTimeoutMs = remainingTimeoutMs(deadlineMs, timeoutError);
+    const bodyTimeoutMs = remainingTimeoutMs(deadlineMs);
     return (await withTimeout({
       operation: readDiscordResponseJson({
         response,
@@ -647,6 +591,18 @@ async function requestDiscordJson<T>(params: {
   throw new Error(
     `${params.errorPrefix} ${params.method} ${redactDiscordApiPath(params.path)} exceeded retry budget.`,
   );
+}
+
+async function readThreadBindings(stateDir: string): Promise<ThreadBindingRecord[]> {
+  const store = createPluginStateKeyedStore<ThreadBindingRecord>("discord", {
+    namespace: THREAD_BINDINGS_NAMESPACE,
+    maxEntries: THREAD_BINDINGS_MAX_ENTRIES,
+    env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+  });
+  const entries = await store.entries();
+  return entries
+    .map((entry) => entry.value)
+    .filter((entry) => Boolean(entry?.threadId && entry?.targetSessionKey));
 }
 
 function normalizeBoundAt(record: ThreadBindingRecord): number {
@@ -780,10 +736,10 @@ function printOutput(params: { json: boolean; payload: SuccessResult | FailureRe
   }
 }
 
-async function run(argv = process.argv.slice(2)): Promise<SuccessResult | FailureResult> {
+async function run(): Promise<SuccessResult | FailureResult> {
   let args: Args;
   try {
-    args = parseArgs(argv);
+    args = parseArgs();
   } catch (err) {
     return {
       ok: false,
@@ -793,14 +749,6 @@ async function run(argv = process.argv.slice(2)): Promise<SuccessResult | Failur
     };
   }
 
-  // Argument-only invocations need no state runtime; initialize before any live send.
-  const { createPluginStateKeyedStore } =
-    await import("../../src/plugin-state/plugin-state-store.ts");
-  const bindingsStore = createPluginStateKeyedStore<ThreadBindingRecord>("discord", {
-    namespace: THREAD_BINDINGS_NAMESPACE,
-    maxEntries: THREAD_BINDINGS_MAX_ENTRIES,
-    env: { ...process.env, OPENCLAW_STATE_DIR: args.stateDir },
-  });
   const smokeId = `acp-smoke-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const startedAt = Date.now();
   const deadline = startedAt + args.timeoutMs;
@@ -947,9 +895,7 @@ async function run(argv = process.argv.slice(2)): Promise<SuccessResult | Failur
   try {
     while (Date.now() < deadline && !winningBinding) {
       try {
-        const entries = (await bindingsStore.entries())
-          .map((entry) => entry.value)
-          .filter((entry) => Boolean(entry?.threadId && entry?.targetSessionKey));
+        const entries = await readThreadBindings(args.stateDir);
         latestCandidates = resolveCandidateBindings({
           entries,
           minBoundAt: minBindingBoundAt,
@@ -1086,25 +1032,21 @@ async function run(argv = process.argv.slice(2)): Promise<SuccessResult | Failur
   }
 }
 
-async function main(argv = process.argv.slice(2)): Promise<number> {
-  try {
-    validateCliArgs(argv);
-  } catch (err) {
-    writeStderrLine(safeErrorMessage(err));
-    return 1;
-  }
-  if (hasFlag("--help", argv) || hasFlag("-h", argv)) {
+async function main(): Promise<number> {
+  if (hasFlag("--help") || hasFlag("-h")) {
     writeStdoutLine(usage());
     return 0;
   }
-  const result = await run(argv).catch((err: unknown): FailureResult => ({
-    ok: false,
-    stage: "unexpected",
-    smokeId: "n/a",
-    error: safeErrorMessage(err),
-  }));
+  const result = await run().catch(
+    (err: unknown): FailureResult => ({
+      ok: false,
+      stage: "unexpected",
+      smokeId: "n/a",
+      error: safeErrorMessage(err),
+    }),
+  );
   printOutput({
-    json: hasFlag("--json", argv),
+    json: hasFlag("--json"),
     payload: result,
   });
   return result.ok ? 0 : 1;
@@ -1112,10 +1054,14 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
 
 export const testing = {
   parseDriverMode,
-  parseArgs,
+  parseNumber,
+  DISCORD_RESPONSE_BODY_MAX_BYTES,
   redactDiscordApiPath,
+  readDiscordResponseText,
   remainingTimeoutMs,
   requestDiscordJson,
+  resolveStateDir,
+  safeErrorMessage,
 };
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

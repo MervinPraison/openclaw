@@ -1,11 +1,7 @@
 // Context script supports OpenClaw repository automation.
 import { execFileSync } from "node:child_process";
-import fs from "node:fs";
 import path from "node:path";
-import * as ts from "typescript/unstable/ast";
-import { SymbolFlags, type Checker, type Symbol } from "typescript/unstable/sync";
-import { formatNativeTypeScriptDiagnostics } from "../native-typescript-diagnostics.mts";
-import { createNativeTypeScriptProject } from "../native-typescript.mts";
+import ts from "typescript";
 import type { CanonicalSymbol, ProgramContext, SymbolKind } from "./types.js";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -22,29 +18,23 @@ export function createProgramContext(
   repoRoot: string,
   tsconfigName = "tsconfig.json",
 ): ProgramContext {
-  let directory = path.resolve(repoRoot);
-  let configPath = path.resolve(directory, tsconfigName);
-  while (!fs.existsSync(configPath) && path.dirname(directory) !== directory) {
-    directory = path.dirname(directory);
-    configPath = path.resolve(directory, tsconfigName);
+  const configPath = ts.findConfigFile(
+    repoRoot,
+    (candidate) => ts.sys.fileExists(candidate),
+    tsconfigName,
+  );
+  assert(configPath, `Could not find ${tsconfigName}`);
+  const configFile = ts.readConfigFile(configPath, (candidate) => ts.sys.readFile(candidate));
+  if (configFile.error) {
+    throw new Error(ts.flattenDiagnosticMessageText(configFile.error.messageText, "\n"));
   }
-  assert(fs.existsSync(configPath), `Could not find ${tsconfigName}`);
-  const session = createNativeTypeScriptProject({ cwd: repoRoot, configFileName: configPath });
-  try {
-    const diagnostics = session.project.program.getConfigFileParsingDiagnostics();
-    if (diagnostics.length) {
-      throw new Error(formatNativeTypeScriptDiagnostics(diagnostics));
-    }
-  } catch (error) {
-    session.close();
-    throw error;
-  }
+  const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, repoRoot);
+  const program = ts.createProgram(parsed.fileNames, parsed.options);
   return {
     repoRoot,
     tsconfigPath: normalizePath(path.relative(repoRoot, configPath)),
-    project: session.project,
-    checker: session.project.checker,
-    close: () => session.close(),
+    program,
+    checker: program.getTypeChecker(),
     normalizePath,
     relativeToRepo(filePath: string) {
       return normalizePath(path.relative(repoRoot, filePath));
@@ -52,14 +42,17 @@ export function createProgramContext(
   };
 }
 
-function comparableSymbol(checker: Checker, symbol: Symbol | undefined): Symbol | undefined {
+function comparableSymbol(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol | undefined,
+): ts.Symbol | undefined {
   if (!symbol) {
     return undefined;
   }
-  return symbol.flags & SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+  return symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
 }
 
-function symbolKind(symbol: Symbol, declaration: ts.Node | undefined): SymbolKind {
+function symbolKind(symbol: ts.Symbol, declaration: ts.Declaration | undefined): SymbolKind {
   if (declaration) {
     switch (declaration.kind) {
       case ts.SyntaxKind.FunctionDeclaration:
@@ -78,53 +71,49 @@ function symbolKind(symbol: Symbol, declaration: ts.Node | undefined): SymbolKin
         break;
     }
   }
-  if (symbol.flags & SymbolFlags.Function) {
+  if (symbol.flags & ts.SymbolFlags.Function) {
     return "function";
   }
-  if (symbol.flags & SymbolFlags.Class) {
+  if (symbol.flags & ts.SymbolFlags.Class) {
     return "class";
   }
-  if (symbol.flags & SymbolFlags.Interface) {
+  if (symbol.flags & ts.SymbolFlags.Interface) {
     return "interface";
   }
-  if (symbol.flags & SymbolFlags.TypeAlias) {
+  if (symbol.flags & ts.SymbolFlags.TypeAlias) {
     return "type";
   }
-  if (symbol.flags & SymbolFlags.Enum) {
+  if (symbol.flags & ts.SymbolFlags.Enum) {
     return "enum";
   }
-  if (symbol.flags & SymbolFlags.Variable) {
+  if (symbol.flags & ts.SymbolFlags.Variable) {
     return "variable";
   }
   return "unknown";
 }
 
-export function canonicalSymbolInfo(context: ProgramContext, symbol: Symbol): CanonicalSymbol {
+export function canonicalSymbolInfo(context: ProgramContext, symbol: ts.Symbol): CanonicalSymbol {
   const resolved = comparableSymbol(context.checker, symbol) ?? symbol;
   const declaration =
-    resolved.declarations
-      .find((candidate) => candidate.kind !== ts.SyntaxKind.SourceFile)
-      ?.resolve(context.project) ??
-    symbol.declarations
-      .find((candidate) => candidate.kind !== ts.SyntaxKind.SourceFile)
-      ?.resolve(context.project);
-  assert(declaration, `Missing declaration for symbol ${symbol.name}`);
+    resolved.getDeclarations()?.find((candidate) => candidate.kind !== ts.SyntaxKind.SourceFile) ??
+    symbol.getDeclarations()?.find((candidate) => candidate.kind !== ts.SyntaxKind.SourceFile);
+  assert(declaration, `Missing declaration for symbol ${symbol.getName()}`);
   const sourceFile = declaration.getSourceFile();
   const declarationPath = context.relativeToRepo(sourceFile.fileName);
   const declarationLine = sourceFile.getLineAndCharacterOfPosition(declaration.getStart()).line + 1;
   return {
-    canonicalKey: `${declarationPath}:${declarationLine}:${resolved.name}`,
+    canonicalKey: `${declarationPath}:${declarationLine}:${resolved.getName()}`,
     declarationPath,
     declarationLine,
     kind: symbolKind(resolved, declaration),
-    aliasName: symbol.name !== resolved.name ? symbol.name : undefined,
+    aliasName: symbol.getName() !== resolved.getName() ? symbol.getName() : undefined,
   };
 }
 
 export function countIdentifierUsages(
   context: ProgramContext,
   sourceFile: ts.SourceFile,
-  importedSymbol: Symbol,
+  importedSymbol: ts.Symbol,
   localName: string,
 ): number {
   const targetSymbol = comparableSymbol(context.checker, importedSymbol);
@@ -140,16 +129,16 @@ export function countIdentifierUsages(
         count += 1;
       }
     }
-    node.forEachChild(visit);
+    ts.forEachChild(node, visit);
   };
-  sourceFile.forEachChild(visit);
+  ts.forEachChild(sourceFile, visit);
   return count;
 }
 
 export function countNamespacePropertyUsages(
   context: ProgramContext,
   sourceFile: ts.SourceFile,
-  namespaceSymbol: Symbol,
+  namespaceSymbol: ts.Symbol,
   exportedName: string,
 ): number {
   const targetSymbol = comparableSymbol(context.checker, namespaceSymbol);
@@ -168,9 +157,9 @@ export function countNamespacePropertyUsages(
         count += 1;
       }
     }
-    node.forEachChild(visit);
+    ts.forEachChild(node, visit);
   };
-  sourceFile.forEachChild(visit);
+  ts.forEachChild(sourceFile, visit);
   return count;
 }
 

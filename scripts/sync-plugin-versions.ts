@@ -1,8 +1,6 @@
 // Sync Plugin Versions script supports OpenClaw repository automation.
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { parse as parseSemver } from "semver";
-import { compareOpenClawSemver } from "../src/infra/semver.js";
 
 type PackageJson = {
   name?: string;
@@ -27,11 +25,6 @@ type SyncPluginVersionsOptions = {
 };
 
 const OPENCLAW_VERSION_RANGE_RE = /^>=\d{4}\.\d{1,2}\.\d{1,2}(?:[-.][^"\s]+)?$/u;
-const VERSION_ALIGNED_PACKAGE_DIRS = [
-  "packages/ai",
-  "packages/gateway-client",
-  "packages/gateway-protocol",
-] as const;
 
 function syncOpenClawDependencyRange(
   deps: Record<string, string> | undefined,
@@ -55,12 +48,11 @@ function syncPluginApiVersion(pkg: PackageJson, targetVersion: string): boolean 
   if (!current || !OPENCLAW_VERSION_RANGE_RE.test(current)) {
     return false;
   }
-  const currentVersion = parseSemver(current.slice(2));
-  const nextVersion = parseSemver(targetVersion);
-  if (!currentVersion || !nextVersion || compareOpenClawSemver(nextVersion, currentVersion) <= 0) {
+  const next = `>=${targetVersion}`;
+  if (current === next) {
     return false;
   }
-  compat.pluginApi = `>=${targetVersion}`;
+  compat.pluginApi = next;
   return true;
 }
 
@@ -124,22 +116,6 @@ export function syncPluginVersions(
   const updated: string[] = [];
   const changelogged: string[] = [];
   const skipped: string[] = [];
-
-  for (const packageDir of VERSION_ALIGNED_PACKAGE_DIRS) {
-    const packagePath = join(rootDir, packageDir, "package.json");
-    if (!existsSync(packagePath)) {
-      continue;
-    }
-    const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as PackageJson;
-    if (!pkg.name || pkg.version === targetVersion) {
-      continue;
-    }
-    pkg.version = targetVersion;
-    if (write) {
-      writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
-    }
-    updated.push(pkg.name);
-  }
 
   for (const dir of dirs) {
     const packagePath = join(extensionsDir, dir.name, "package.json");
