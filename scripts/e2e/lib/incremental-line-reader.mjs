@@ -3,7 +3,17 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 
 function readSlice(filePath, start, length) {
-  return readBufferSlice(filePath, start, length).toString("utf8");
+  if (length <= 0) {
+    return "";
+  }
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function readBufferSlice(filePath, start, length) {
@@ -94,7 +104,11 @@ export function createIncrementalLineReader(filePath, options = {}) {
       let start = offset;
       let discardFirstLine = false;
       let clamped = false;
-      if (stats.size - start > maxReadBytes) {
+      if (start === 0 && stats.size > maxReadBytes) {
+        start = stats.size - maxReadBytes;
+        pending = "";
+        clamped = true;
+      } else if (stats.size - start > maxReadBytes) {
         start = stats.size - maxReadBytes;
         pending = "";
         clamped = true;

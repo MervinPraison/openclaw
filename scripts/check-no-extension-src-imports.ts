@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { collectFilesSync, isCodeFile, relativeToCwd } from "./check-file-utils.js";
-import { classifyBundledExtensionSourcePath } from "./lib/extension-source-classifier.mts";
+import { classifyBundledExtensionSourcePath } from "./lib/extension-source-classifier.mjs";
 
 const FORBIDDEN_REPO_SRC_IMPORT = /["'](?:\.\.\/)+(?:src\/)[^"']+["']/;
 

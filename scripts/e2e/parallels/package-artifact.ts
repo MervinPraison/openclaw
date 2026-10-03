@@ -1,11 +1,8 @@
 // Package Artifact script supports OpenClaw repository automation.
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { resolveNpmJsonEntries } from "../../lib/npm-json-output.mts";
-import { sleep as delay } from "../../lib/sleep.mjs";
-import { createPrepublishPluginRegistryArtifact } from "../../prepublish-plugin-registry-artifact.mjs";
 import { readPositiveIntEnv } from "./env-limits.ts";
 import { exists, readJson } from "./filesystem.ts";
 import { die, repoRoot, run, say, sh } from "./host-command.ts";
@@ -27,26 +24,6 @@ export async function packageBuildCommitFromTgz(tgzPath: string): Promise<string
     "package/dist/build-info.json",
   );
   return info.commit ?? "";
-}
-
-function resolveNpmPackTarballFilename(value: unknown): string {
-  const result = resolveNpmJsonEntries(value).at(-1);
-  const filename =
-    result &&
-    typeof result === "object" &&
-    "filename" in result &&
-    typeof result.filename === "string"
-      ? result.filename.trim()
-      : "";
-  if (
-    !filename.endsWith(".tgz") ||
-    filename.includes("\0") ||
-    filename !== path.basename(filename) ||
-    filename !== path.win32.basename(filename)
-  ) {
-    die("npm pack did not report a safe tarball filename");
-  }
-  return filename;
 }
 
 export function resolveOpenClawRegistryVersion(specOrAlias: string): string {
@@ -78,6 +55,14 @@ export function resolveOpenClawRegistryVersion(specOrAlias: string): string {
 
 function npmViewVersion(spec: string): string {
   return run("npm", ["view", spec, "version"], { quiet: true }).stdout.trim();
+}
+
+export async function ensureCurrentBuild(input: {
+  lockDir: string;
+  requireControlUi?: boolean;
+  checkDirty?: boolean;
+}): Promise<void> {
+  await withPackageLock(input.lockDir, async () => ensureCurrentBuildUnlocked(input));
 }
 
 async function ensureCurrentBuildUnlocked(input: {
@@ -138,7 +123,6 @@ export async function packOpenClaw(input: {
   destination: string;
   packageSpec?: string;
   requireControlUi?: boolean;
-  requiredCompanionPackages?: readonly string[];
 }): Promise<PackageArtifact> {
   await mkdir(input.destination, { recursive: true });
   if (input.packageSpec) {
@@ -155,8 +139,11 @@ export async function packOpenClaw(input: {
       ],
       { quiet: true },
     ).stdout;
-    const packed = resolveNpmPackTarballFilename(JSON.parse(output));
-    const tgzPath = path.join(input.destination, packed);
+    const packed = JSON.parse(output).at(-1)?.filename as string | undefined;
+    if (!packed) {
+      die("npm pack did not report a filename");
+    }
+    const tgzPath = path.join(input.destination, path.basename(packed));
     const version = await packageVersionFromTgz(tgzPath);
     say(`Packed ${tgzPath}`);
     say(`Target package version: ${version}`);
@@ -168,59 +155,33 @@ export async function packOpenClaw(input: {
       checkDirty: true,
       requireControlUi: input.requireControlUi,
     });
+    run("node", [
+      "--import",
+      "tsx",
+      "--input-type=module",
+      "--eval",
+      "import { writePackageDistInventory } from './src/infra/package-dist-inventory.ts'; await writePackageDistInventory(process.cwd());",
+    ]);
     const shortHead = run("git", ["rev-parse", "--short", "HEAD"], { quiet: true }).stdout.trim();
-    const tgzPath = path.join(input.destination, `openclaw-main-${shortHead}.tgz`);
-    // The canonical helper inventories the package, bundles private workspace runtime code,
-    // and rejects tarballs that still depend on unpublished workspace packages.
-    const packedPath = run(
-      "node",
-      [
-        "scripts/package-openclaw-for-docker.mjs",
-        "--allow-unreleased-changelog",
-        "--skip-build",
-        "--source-dir",
-        repoRoot,
-        "--output-dir",
-        input.destination,
-        "--output-name",
-        path.basename(tgzPath),
-        "--pnpm-pack",
-      ],
-      { quiet: true },
-    ).stdout.trim();
-    if (path.resolve(packedPath) !== path.resolve(tgzPath)) {
-      die(`package helper wrote an unexpected tarball: ${packedPath}`);
+    const output = run(
+      "npm",
+      ["pack", "--ignore-scripts", "--json", "--pack-destination", input.destination],
+      {
+        quiet: true,
+      },
+    ).stdout;
+    const packed = JSON.parse(output).at(-1)?.filename as string | undefined;
+    if (!packed) {
+      die("npm pack did not report a filename");
     }
+    const tgzPath = path.join(input.destination, `openclaw-main-${shortHead}.tgz`);
+    await copyFile(path.join(input.destination, packed), tgzPath);
     const buildCommit = await packageBuildCommitFromTgz(tgzPath);
     if (!buildCommit) {
       die(`failed to read packed build commit from ${tgzPath}`);
     }
-    const version = await packageVersionFromTgz(tgzPath);
-    const registryDir = path.join(input.destination, "plugins");
-    // Source-built core and required official plugins must describe one exact
-    // checkout; the canonical artifact creator rejects dirty or mismatched sources.
-    const registry = input.requiredCompanionPackages?.length
-      ? createPrepublishPluginRegistryArtifact({
-          repoRoot,
-          outputDir: registryDir,
-          sourceSha: buildCommit,
-          candidateVersion: version,
-          requiredPackages: [...input.requiredCompanionPackages],
-        })
-      : undefined;
-    const registryPackages = registry?.manifest.packages.map((entry) => ({
-      name: entry.name,
-      version: entry.version,
-      tarballPath: path.join(registryDir, entry.tarball),
-    }));
     say(`Packed ${tgzPath}`);
-    return {
-      buildCommit,
-      buildCommitShort: buildCommit.slice(0, 7),
-      path: tgzPath,
-      version,
-      registryPackages,
-    };
+    return { buildCommit, buildCommitShort: buildCommit.slice(0, 7), path: tgzPath };
   });
 }
 
@@ -234,27 +195,18 @@ async function withPackageLock<T>(lockDir: string, fn: () => Promise<T>): Promis
   }
 }
 
-async function acquirePackageLock(
-  lockDir: string,
-  ownerToken: string,
-  params: { writeOwner?: (lockDir: string, ownerToken: string) => Promise<void> } = {},
-): Promise<void> {
+async function acquirePackageLock(lockDir: string, ownerToken: string): Promise<void> {
   const timeoutMs = readPositiveIntEnv("OPENCLAW_PARALLELS_PACKAGE_LOCK_TIMEOUT_MS", 30 * 60_000);
   const staleMs = readPositiveIntEnv("OPENCLAW_PARALLELS_PACKAGE_LOCK_STALE_MS", 2 * 60 * 60_000);
   const startedAt = Date.now();
   let waitAnnouncementBudget = 1;
   const consumeWaitAnnouncement = () => waitAnnouncementBudget-- > 0;
   while (Date.now() - startedAt < timeoutMs) {
-    let createdLockDir = false;
     try {
       await mkdir(lockDir);
-      createdLockDir = true;
-      await (params.writeOwner ?? writeLockOwner)(lockDir, ownerToken);
+      await writeLockOwner(lockDir, ownerToken);
       return;
     } catch (error) {
-      if (createdLockDir) {
-        await rm(lockDir, { force: true, recursive: true }).catch(() => undefined);
-      }
       if (!isErrorCode(error, "EEXIST")) {
         throw error;
       }
@@ -297,7 +249,7 @@ async function removeStalePackageLock(lockDir: string, staleMs: number): Promise
     return;
   }
   const ageMs = Date.now() - ((await stat(lockDir).catch(() => undefined))?.mtimeMs ?? Date.now());
-  if (owner?.pid !== undefined || staleMs <= 0 || ageMs >= staleMs) {
+  if (owner || ageMs >= staleMs) {
     await rm(lockDir, { force: true, recursive: true }).catch(() => undefined);
   }
 }
@@ -310,10 +262,7 @@ async function readLockOwner(lockDir: string): Promise<{ pid?: number; token?: s
   try {
     const parsed = JSON.parse(text) as { pid?: unknown; token?: unknown };
     return {
-      pid:
-        typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0
-          ? parsed.pid
-          : undefined,
+      pid: typeof parsed.pid === "number" ? parsed.pid : undefined,
       token: typeof parsed.token === "string" ? parsed.token : undefined,
     };
   } catch {
@@ -334,9 +283,8 @@ function isErrorCode(error: unknown, code: string): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
 }
 
-export const testing = {
-  acquirePackageLock,
-  removeStalePackageLock,
-  readLockOwner,
-  resolveNpmPackTarballFilename,
-};
+async function delay(ms: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
