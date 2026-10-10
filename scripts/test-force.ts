@@ -1,12 +1,11 @@
 #!/usr/bin/env -S node --import tsx
+// Test Force script supports OpenClaw repository automation.
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { forceFreePortAndWait } from "../src/cli/ports.js";
-import { resolveGatewayPort } from "../src/config/paths.js";
-
-type PortProcess = Awaited<ReturnType<typeof forceFreePortAndWait>>["killed"][number];
+import { forceFreePort, type PortProcess } from "../src/cli/ports.js";
+import { resolveGatewayPort } from "../src/config/config.js";
 
 function usage(): string {
   return [
@@ -29,9 +28,14 @@ function parseArgs(argv: readonly string[]): { help: boolean } {
   return { help: false };
 }
 
-async function killGatewayListeners(port: number): Promise<PortProcess[]> {
+export const testForceTesting = {
+  parseArgs,
+  usage,
+};
+
+function killGatewayListeners(port: number): PortProcess[] {
   try {
-    const { killed } = await forceFreePortAndWait(port);
+    const killed = forceFreePort(port);
     if (killed.length > 0) {
       console.log(
         `freed port ${port}; terminated: ${killed
@@ -52,7 +56,7 @@ function runTests() {
   const isolatedLock =
     process.env.OPENCLAW_GATEWAY_LOCK ??
     path.join(os.tmpdir(), `openclaw-gateway.lock.test.${Date.now()}`);
-  const result = spawnSync(process.execPath, ["--import", "tsx", "scripts/test-projects.mts"], {
+  const result = spawnSync(process.execPath, ["scripts/test-projects.mjs"], {
     stdio: "inherit",
     env: {
       ...process.env,
@@ -66,7 +70,7 @@ function runTests() {
   process.exit(result.status ?? 1);
 }
 
-async function main(argv: readonly string[] = process.argv.slice(2)) {
+export function main(argv: readonly string[] = process.argv.slice(2)) {
   const args = parseArgs(argv);
   if (args.help) {
     console.log(usage());
@@ -76,7 +80,7 @@ async function main(argv: readonly string[] = process.argv.slice(2)) {
   const port = resolveGatewayPort(undefined, process.env);
 
   console.log(`🧹 test:force - clearing gateway on port ${port}`);
-  const killed = await killGatewayListeners(port);
+  const killed = killGatewayListeners(port);
   if (killed.length === 0) {
     console.log("no listeners to kill");
   }
@@ -87,7 +91,7 @@ async function main(argv: readonly string[] = process.argv.slice(2)) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    await main();
+    main();
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(2);

@@ -1,6 +1,5 @@
 // Npm Verify Exec script supports OpenClaw repository automation.
-import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
-import { readPositiveEnvInt } from "./numeric-options.mjs";
+import { execFileSync } from "node:child_process";
 
 export type NpmVerifyCommandInvocation = {
   command: string;
@@ -8,12 +7,23 @@ export type NpmVerifyCommandInvocation = {
   windowsVerbatimArguments?: boolean;
 };
 
-type NpmVerifyExecOptions = ExecFileSyncOptionsWithStringEncoding & {
-  windowsVerbatimArguments?: boolean;
-};
-
 const DEFAULT_NPM_VERIFY_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_NPM_VERIFY_COMMAND_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+
+function positiveEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (raw === undefined || raw === "") {
+    return fallback;
+  }
+  if (!/^[1-9]\d*$/u.test(raw)) {
+    throw new Error(`invalid ${name}: ${raw}`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`invalid ${name}: ${raw}`);
+  }
+  return value;
+}
 
 export function runNpmVerifyCommand(
   invocation: NpmVerifyCommandInvocation,
@@ -22,20 +32,15 @@ export function runNpmVerifyCommand(
 ): string {
   const timeoutMs =
     options.timeoutMs ??
-    readPositiveEnvInt(
-      "OPENCLAW_NPM_VERIFY_COMMAND_TIMEOUT_MS",
-      process.env,
-      DEFAULT_NPM_VERIFY_COMMAND_TIMEOUT_MS,
-    );
+    positiveEnvInt("OPENCLAW_NPM_VERIFY_COMMAND_TIMEOUT_MS", DEFAULT_NPM_VERIFY_COMMAND_TIMEOUT_MS);
   const maxBuffer =
     options.maxBufferBytes ??
-    readPositiveEnvInt(
+    positiveEnvInt(
       "OPENCLAW_NPM_VERIFY_COMMAND_MAX_BUFFER_BYTES",
-      process.env,
       DEFAULT_NPM_VERIFY_COMMAND_MAX_BUFFER_BYTES,
     );
 
-  const execOptions: NpmVerifyExecOptions = {
+  return execFileSync(invocation.command, invocation.args, {
     cwd,
     encoding: "utf8",
     killSignal: "SIGKILL",
@@ -43,6 +48,5 @@ export function runNpmVerifyCommand(
     stdio: ["ignore", "pipe", "pipe"],
     timeout: timeoutMs,
     windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-  };
-  return execFileSync(invocation.command, invocation.args, execOptions).trim();
+  }).trim();
 }

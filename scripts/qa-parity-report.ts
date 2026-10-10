@@ -1,11 +1,21 @@
-import { booleanFlag, parseFlagArgs, stringFlag } from "./lib/arg-utils.mts";
+// Qa Parity Report script supports OpenClaw repository automation.
+import { runQaParityReportCommand } from "../extensions/qa-lab/src/cli.runtime.ts";
+import { booleanFlag, parseFlagArgs, stringFlag } from "./lib/arg-utils.mjs";
 
-type Options = Parameters<
-  typeof import("../extensions/qa-lab/src/cli.runtime.ts").runQaParityReportCommand
->[0];
+type Options = {
+  baselineLabel?: string;
+  baselineSummary?: string;
+  candidateLabel?: string;
+  candidateSummary?: string;
+  outputDir?: string;
+  repoRoot?: string;
+  runtimeAxis?: boolean;
+  summary?: string;
+  tokenEfficiency?: boolean;
+};
 
 function parseArgs(args: string[]): Options {
-  return parseFlagArgs<Options>(
+  return parseFlagArgs(
     args,
     {},
     [
@@ -41,27 +51,31 @@ Options:
         process.exit(0);
       },
     },
-  );
+  ) as Options;
 }
 
-try {
-  const opts = parseArgs(process.argv.slice(2));
-  if (opts.runtimeAxis) {
-    if (!opts.summary) {
-      throw new Error("--summary is required when --runtime-axis is set.");
-    }
-  } else {
-    if (!opts.candidateSummary) {
-      throw new Error("--candidate-summary is required.");
-    }
-    if (!opts.baselineSummary) {
-      throw new Error("--baseline-summary is required.");
-    }
+const opts = parseArgs(process.argv.slice(2));
+if (opts.runtimeAxis) {
+  if (!opts.summary) {
+    throw new Error("--summary is required when --runtime-axis is set.");
   }
-
-  const { runQaParityReportCommand } = await import("../extensions/qa-lab/src/cli.runtime.ts");
-  await runQaParityReportCommand(opts);
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
+} else {
+  if (!opts.candidateSummary) {
+    throw new Error("--candidate-summary is required.");
+  }
+  if (!opts.baselineSummary) {
+    throw new Error("--baseline-summary is required.");
+  }
 }
+
+await runQaParityReportCommand({
+  ...(opts.baselineSummary ? { baselineSummary: opts.baselineSummary } : {}),
+  ...(opts.candidateSummary ? { candidateSummary: opts.candidateSummary } : {}),
+  ...(opts.baselineLabel ? { baselineLabel: opts.baselineLabel } : {}),
+  ...(opts.candidateLabel ? { candidateLabel: opts.candidateLabel } : {}),
+  ...(opts.outputDir ? { outputDir: opts.outputDir } : {}),
+  ...(opts.repoRoot ? { repoRoot: opts.repoRoot } : {}),
+  ...(opts.runtimeAxis ? { runtimeAxis: opts.runtimeAxis } : {}),
+  ...(opts.summary ? { summary: opts.summary } : {}),
+  ...(opts.tokenEfficiency ? { tokenEfficiency: opts.tokenEfficiency } : {}),
+});

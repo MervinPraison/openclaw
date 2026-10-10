@@ -1,11 +1,18 @@
-import { booleanFlag, parseFlagArgs, stringFlag, stringListFlag } from "./lib/arg-utils.mts";
+// Qa Coverage Report script supports OpenClaw repository automation.
+import { runQaCoverageReportCommand } from "../extensions/qa-lab/src/cli.runtime.ts";
+import { booleanFlag, parseFlagArgs, stringFlag, stringListFlag } from "./lib/arg-utils.mjs";
 
-type Options = Parameters<
-  typeof import("../extensions/qa-lab/src/cli.runtime.ts").runQaCoverageReportCommand
->[0];
+type Options = {
+  json?: boolean;
+  match?: string[];
+  output?: string;
+  repoRoot?: string;
+  summary?: string;
+  tools?: boolean;
+};
 
 function parseArgs(args: string[]): Options {
-  return parseFlagArgs<Options>(
+  return parseFlagArgs(
     args,
     {},
     [
@@ -35,14 +42,15 @@ Options:
         process.exit(0);
       },
     },
-  );
+  ) as Options;
 }
 
-try {
-  const opts = parseArgs(process.argv.slice(2));
-  const { runQaCoverageReportCommand } = await import("../extensions/qa-lab/src/cli.runtime.ts");
-  await runQaCoverageReportCommand(opts);
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-}
+const opts = parseArgs(process.argv.slice(2));
+await runQaCoverageReportCommand({
+  ...(opts.json ? { json: true } : {}),
+  ...(opts.match ? { match: opts.match } : {}),
+  ...(opts.output ? { output: opts.output } : {}),
+  ...(opts.repoRoot ? { repoRoot: opts.repoRoot } : {}),
+  ...(opts.summary ? { summary: opts.summary } : {}),
+  ...(opts.tools ? { tools: true } : {}),
+});

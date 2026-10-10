@@ -1,20 +1,62 @@
-import { isRecord } from "../../lib/record-shared.mjs";
-import { readTextFileTail, tailText, textFileContains } from "./text-file-utils.mjs";
+// Helpers for extracting agent turn output from E2E protocol events.
+import fs from "node:fs";
+import { readTextFileTail, tailText } from "./text-file-utils.mjs";
 
 const ERROR_DETAIL_TAIL_BYTES = 64 * 1024;
 const OUTPUT_SCAN_TAIL_BYTES = 2 * 1024 * 1024;
 const REPLY_TEXT_PREVIEW_BYTES = 8 * 1024;
 const REPLY_TEXT_PREVIEW_COUNT = 5;
+const REQUEST_LOG_SCAN_CHUNK_BYTES = 64 * 1024;
+const REQUEST_LOG_SCAN_CARRY_CHARS = 256;
 const OPENAI_REQUEST_PATH_PATTERN = /\/v1\/(responses|chat\/completions)/u;
+
+function textByteLength(text) {
+  return Buffer.byteLength(text, "utf8");
+}
 
 function summarizeReplyTexts(replyTexts) {
   const previewStart = Math.max(0, replyTexts.length - REPLY_TEXT_PREVIEW_COUNT);
   const recent = replyTexts.slice(previewStart).map((text, index) => ({
     index: previewStart + index,
-    bytes: Buffer.byteLength(text, "utf8"),
+    bytes: textByteLength(text),
     tail: tailText(text, REPLY_TEXT_PREVIEW_BYTES),
   }));
   return JSON.stringify({ count: replyTexts.length, recent });
+}
+
+function fileContainsPattern(file, pattern) {
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    return false;
+  }
+  if (!stat.isFile() || stat.size <= 0) {
+    return false;
+  }
+
+  const fd = fs.openSync(file, "r");
+  try {
+    const buffer = Buffer.alloc(Math.min(REQUEST_LOG_SCAN_CHUNK_BYTES, stat.size));
+    let carry = "";
+    let offset = 0;
+    while (offset < stat.size) {
+      const bytesToRead = Math.min(buffer.length, stat.size - offset);
+      const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead, offset);
+      if (bytesRead <= 0) {
+        break;
+      }
+      offset += bytesRead;
+      const text = carry + buffer.subarray(0, bytesRead).toString("utf8");
+      if (pattern.test(text)) {
+        return true;
+      }
+      carry = text.slice(-REQUEST_LOG_SCAN_CARRY_CHARS);
+    }
+    return false;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function parseJson(text) {
@@ -23,19 +65,6 @@ function parseJson(text) {
   } catch {
     return undefined;
   }
-}
-
-function isJsonObjectRecordStart(text, index) {
-  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
-    const char = text[cursor];
-    if (char === "\n" || char === "\r") {
-      return true;
-    }
-    if (char !== " " && char !== "\t") {
-      return false;
-    }
-  }
-  return true;
 }
 
 function parseJsonObjectsFromText(text) {
@@ -48,7 +77,7 @@ function parseJsonObjectsFromText(text) {
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
     if (start === -1) {
-      if (char === "{" && isJsonObjectRecordStart(text, index)) {
+      if (char === "{") {
         start = index;
         depth = 1;
         inString = false;
@@ -106,6 +135,10 @@ function parseJsonPayloads(text) {
 
 function textValues(values) {
   return values.filter((value) => typeof value === "string" && value.length > 0);
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function isFailureStatus(value) {
@@ -175,7 +208,7 @@ export function assertAgentReplyContainsMarker(marker, outputPath) {
 }
 
 export function assertOpenAiRequestLogUsed(requestLogPath, label = "mock OpenAI server") {
-  if (textFileContains(requestLogPath, OPENAI_REQUEST_PATH_PATTERN)) {
+  if (fileContainsPattern(requestLogPath, OPENAI_REQUEST_PATH_PATTERN)) {
     return;
   }
   const requestLogTail = readTextFileTail(requestLogPath, ERROR_DETAIL_TAIL_BYTES);

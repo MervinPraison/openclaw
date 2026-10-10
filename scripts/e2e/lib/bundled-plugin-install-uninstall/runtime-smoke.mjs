@@ -1,3 +1,4 @@
+// Runtime smoke script for bundled plugin install/uninstall E2E validation.
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -5,20 +6,8 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { appendBoundedTail } from "../../../lib/bounded-output-tail.mjs";
-import {
-  createBoundedResponseTooLargeError,
-  readBoundedResponseText,
-  toLintErrorObject,
-} from "../../../lib/bounded-response.mjs";
-import { isRecord } from "../../../lib/record-shared.mjs";
-import { resolveWindowsTaskkillPath } from "../../../lib/windows-taskkill.mjs";
-import { readJson, writeJson } from "../fixtures/common.mjs";
-import { resolveGatewayCliPayload } from "../gateway-frame-payload.mjs";
 
 const TOKEN = "bundled-plugin-runtime-smoke-token";
-const RUNTIME_PORT_BASE_ENV = "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE";
-const TCP_PORT_MAX = 65535;
 const OUTPUT_CAPTURE_CHARS = readPositiveIntEnv(
   "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_OUTPUT_CHARS",
   1024 * 1024,
@@ -40,7 +29,6 @@ const RPC_READY_TIMEOUT_MS = readPositiveIntEnv(
 );
 const COMMAND_TIMEOUT_MS = readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_COMMAND_MS", 120000);
 const HTTP_PROBE_TIMEOUT_MS = readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_HTTP_MS", 5000);
-const HTTP_PROBE_BODY_MAX_BYTES = 1024 * 1024;
 const GATEWAY_TEARDOWN_GRACE_MS = readPositiveIntEnv(
   "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_TEARDOWN_GRACE_MS",
   10000,
@@ -66,30 +54,31 @@ const parentSignalHandlers = new Map();
 let parentCleanupInstalled = false;
 
 function readPositiveIntEnv(name, fallback) {
-  return readInteger(process.env[name], fallback, name, 1);
+  return readPositiveInt(process.env[name], fallback, name);
 }
 
-function readInteger(raw, fallback, name, minimum) {
+function readPositiveInt(raw, fallback, name) {
   const text = String(raw ?? "").trim();
   if (!text) {
     return fallback;
   }
+  if (!/^\d+$/u.test(text)) {
+    throw new Error(`invalid ${name}: ${text}`);
+  }
   const parsed = Number(text);
-  if (!/^\d+$/u.test(text) || !Number.isSafeInteger(parsed) || parsed < minimum) {
+  if (!Number.isInteger(parsed) || parsed <= 0) {
     throw new Error(`invalid ${name}: ${text}`);
   }
   return parsed;
 }
 
-export function resolveRuntimeSmokePort(pluginIndex, offset = 0, env = process.env) {
-  const base = readInteger(env[RUNTIME_PORT_BASE_ENV], 19000, RUNTIME_PORT_BASE_ENV, 1);
-  const port = base + pluginIndex * 3 + offset;
-  if (!Number.isSafeInteger(port) || port > TCP_PORT_MAX) {
-    throw new Error(
-      `${RUNTIME_PORT_BASE_ENV} with bundled plugin runtime index ${pluginIndex} and offset ${offset} must resolve to a TCP port from 1 to 65535. Got: ${port}`,
-    );
-  }
-  return port;
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function readFileChunk(file, startOffset, maxBytes) {
@@ -97,41 +86,46 @@ function readFileChunk(file, startOffset, maxBytes) {
   try {
     stat = fs.statSync(file);
   } catch {
-    return Buffer.alloc(0);
+    return { buffer: Buffer.alloc(0), startOffset: 0, size: 0 };
   }
   if (!stat.isFile() || stat.size <= 0) {
-    return Buffer.alloc(0);
+    return { buffer: Buffer.alloc(0), startOffset: 0, size: stat.size };
   }
 
-  const safeStartOffset = Math.min(startOffset, stat.size);
-  const bytesToRead = Math.min(maxBytes, stat.size - safeStartOffset);
+  const safeMaxBytes = Math.max(1, Math.floor(Number(maxBytes) || LOG_SCAN_BYTES));
+  const safeStartOffset = Math.min(Math.max(0, Math.floor(Number(startOffset) || 0)), stat.size);
+  const bytesToRead = Math.min(safeMaxBytes, stat.size - safeStartOffset);
   if (bytesToRead <= 0) {
-    return Buffer.alloc(0);
+    return { buffer: Buffer.alloc(0), startOffset: safeStartOffset, size: stat.size };
   }
 
   const buffer = Buffer.alloc(bytesToRead);
   const fd = fs.openSync(file, "r");
   try {
     const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead, safeStartOffset);
-    return buffer.subarray(0, bytesRead);
+    return { buffer: buffer.subarray(0, bytesRead), startOffset: safeStartOffset, size: stat.size };
   } finally {
     fs.closeSync(fd);
   }
 }
 
-export function readFileTail(file, maxBytes = LOG_SCAN_BYTES) {
+function readFileTailBuffer(file, maxBytes = LOG_SCAN_BYTES) {
   let stat;
   try {
     stat = fs.statSync(file);
   } catch {
-    return "";
+    return { buffer: Buffer.alloc(0), startOffset: 0, size: 0 };
   }
   const safeMaxBytes = Math.max(1, Math.floor(Number(maxBytes) || LOG_SCAN_BYTES));
   const startOffset = Math.max(0, stat.size - safeMaxBytes);
-  return readFileChunk(file, startOffset, safeMaxBytes).toString("utf8");
+  return readFileChunk(file, startOffset, safeMaxBytes);
 }
 
-export function findReadyLogOffset(file) {
+export function readFileTail(file, maxBytes = LOG_SCAN_BYTES) {
+  return readFileTailBuffer(file, maxBytes).buffer.toString("utf8");
+}
+
+function findFirstNeedleOffset(file, needles) {
   let stat;
   try {
     stat = fs.statSync(file);
@@ -142,7 +136,7 @@ export function findReadyLogOffset(file) {
     return 0;
   }
 
-  const carryBytes = Math.max(0, ...READY_OFFSET_LOG_NEEDLES.map((needle) => needle.length - 1));
+  const carryBytes = Math.max(0, ...needles.map((needle) => needle.length - 1));
   const chunk = Buffer.alloc(Math.min(LOG_SCAN_BYTES, stat.size));
   const fd = fs.openSync(file, "r");
   let carry = Buffer.alloc(0);
@@ -157,9 +151,9 @@ export function findReadyLogOffset(file) {
       const view = chunk.subarray(0, bytesRead);
       const combined = carry.length > 0 ? Buffer.concat([carry, view]) : view;
       const combinedOffset = offset - carry.length;
-      const indexes = READY_OFFSET_LOG_NEEDLES.map((needle) => combined.indexOf(needle)).filter(
-        (index) => index >= 0,
-      );
+      const indexes = needles
+        .map((needle) => combined.indexOf(needle))
+        .filter((index) => index >= 0);
       if (indexes.length > 0) {
         return combinedOffset + Math.min(...indexes);
       }
@@ -196,7 +190,7 @@ export function createReadyLogScanner(file) {
       offset = 0;
     }
     while (offset < stat.size) {
-      const buffer = readFileChunk(file, offset, LOG_SCAN_BYTES);
+      const { buffer } = readFileChunk(file, offset, LOG_SCAN_BYTES);
       if (buffer.length === 0) {
         break;
       }
@@ -213,13 +207,17 @@ export function createReadyLogScanner(file) {
   };
 }
 
-function loadManifest(pluginDir, pluginRoot) {
+function manifestPath(pluginDir, pluginRoot) {
   const candidates = [
     ...(isNonEmptyString(pluginRoot) ? [path.join(pluginRoot, "openclaw.plugin.json")] : []),
     path.join(process.cwd(), "dist", "extensions", pluginDir, "openclaw.plugin.json"),
     path.join(process.cwd(), "dist-runtime", "extensions", pluginDir, "openclaw.plugin.json"),
   ];
-  const file = candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
+}
+
+function loadManifest(pluginDir, pluginRoot) {
+  const file = manifestPath(pluginDir, pluginRoot);
   if (!fs.existsSync(file)) {
     throw new Error(`missing bundled plugin manifest: ${file}`);
   }
@@ -344,6 +342,15 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+export function appendBoundedOutput(buffer, chunk, maxChars = OUTPUT_CAPTURE_CHARS) {
+  const nextText = buffer.text + String(chunk);
+  if (nextText.length <= maxChars) {
+    return { text: nextText, truncatedChars: buffer.truncatedChars };
+  }
+  const truncatedChars = buffer.truncatedChars + nextText.length - maxChars;
+  return { text: nextText.slice(-maxChars), truncatedChars };
+}
+
 function formatCapturedOutput(label, buffer) {
   if (!buffer.text) {
     return "";
@@ -403,17 +410,17 @@ export function runCommand(command, args, options = {}) {
       detached,
     });
     if (detached) {
-      trackChild(activeCommandChildren, child);
+      trackCommandChild(child);
     }
     let stdout = { text: "", truncatedChars: 0 };
     let stderr = { text: "", truncatedChars: 0 };
     let timedOut = false;
     let settled = false;
-    child.stdout?.setEncoding("utf8").on("data", (chunk) => {
-      stdout = appendBoundedTail(stdout, chunk, OUTPUT_CAPTURE_CHARS);
+    child.stdout?.on("data", (chunk) => {
+      stdout = appendBoundedOutput(stdout, chunk);
     });
-    child.stderr?.setEncoding("utf8").on("data", (chunk) => {
-      stderr = appendBoundedTail(stderr, chunk, OUTPUT_CAPTURE_CHARS);
+    child.stderr?.on("data", (chunk) => {
+      stderr = appendBoundedOutput(stderr, chunk);
     });
     const clearCommandTimer = timeoutMs
       ? setTimeout(() => {
@@ -492,7 +499,7 @@ export function startGateway(params) {
   child.stderr?.on("data", (chunk) => log.append(chunk));
   child.once("error", () => log.close());
   child.once("close", () => log.close());
-  trackChild(activeGatewayChildren, child);
+  trackGatewayChild(child);
   return child;
 }
 
@@ -500,12 +507,22 @@ export function hasChildExited(child) {
   return child.exitCode !== null || (child.signalCode ?? null) !== null;
 }
 
-function trackChild(children, child) {
-  children.add(child);
+function trackGatewayChild(child) {
+  activeGatewayChildren.add(child);
   const untrack = () => {
     if (!processTreeIsAlive(child)) {
-      children.delete(child);
+      activeGatewayChildren.delete(child);
     }
+  };
+  child.once("error", untrack);
+  child.once("close", untrack);
+  installParentCleanup();
+}
+
+function trackCommandChild(child) {
+  activeCommandChildren.add(child);
+  const untrack = () => {
+    activeCommandChildren.delete(child);
   };
   child.once("error", untrack);
   child.once("close", untrack);
@@ -537,12 +554,16 @@ function installParentCleanup() {
 }
 
 function cleanupActiveChildren(signal) {
-  for (const children of [activeCommandChildren, activeGatewayChildren]) {
-    for (const child of children) {
-      signalChildProcessTree(child, signal);
-      if (process.platform !== "win32") {
-        signalChildProcessTree(child, "SIGKILL");
-      }
+  for (const child of activeCommandChildren) {
+    signalChildProcessTree(child, signal);
+    if (process.platform !== "win32") {
+      signalChildProcessTree(child, "SIGKILL");
+    }
+  }
+  for (const child of activeGatewayChildren) {
+    signalChildProcessTree(child, signal);
+    if (process.platform !== "win32") {
+      signalChildProcessTree(child, "SIGKILL");
     }
   }
 }
@@ -588,35 +609,14 @@ function processTreeIsAlive(child) {
   }
 }
 
-export function signalChildProcessTree(
-  child,
-  signal,
-  { platform = process.platform, runTaskkill = childProcess.spawnSync } = {},
-) {
-  if (platform !== "win32" && typeof child.pid === "number") {
+function signalChildProcessTree(child, signal) {
+  if (process.platform !== "win32" && typeof child.pid === "number") {
     try {
       process.kill(-child.pid, signal);
       return;
     } catch {
       // Non-detached callers may not own a process group keyed by child.pid; keep
       // the legacy direct-child kill path as the fallback.
-    }
-  }
-  if (platform === "win32" && typeof child.pid === "number") {
-    const args = ["/PID", String(child.pid), "/T"];
-    if (signal === "SIGKILL") {
-      args.push("/F");
-    }
-    const taskkillPath = resolveWindowsTaskkillPath();
-    const result = runTaskkill(taskkillPath, args, { stdio: "ignore" });
-    if (!result?.error && result?.status === 0) {
-      return;
-    }
-    if (signal !== "SIGKILL") {
-      const forceResult = runTaskkill(taskkillPath, [...args, "/F"], { stdio: "ignore" });
-      if (!forceResult?.error && forceResult?.status === 0) {
-        return;
-      }
     }
   }
   try {
@@ -665,37 +665,18 @@ export async function waitForReady(params) {
 async function fetchHttpProbeStatus(port, pathName, options = {}) {
   const { parseJson = false, timeoutMs = HTTP_PROBE_TIMEOUT_MS } = options;
   const controller = new AbortController();
-  const timeoutError = Object.assign(
-    new Error(`${pathName} probe timed out after ${timeoutMs}ms`),
-    {
-      code: "ETIMEDOUT",
-    },
-  );
-  let clearProbeTimer;
-  const timeoutPromise = timeoutMs
-    ? new Promise((_, reject) => {
-        clearProbeTimer = setTimeout(() => {
-          controller.abort(timeoutError);
-          reject(timeoutError);
-        }, timeoutMs);
-        clearProbeTimer.unref?.();
-      })
+  const clearProbeTimer = timeoutMs
+    ? setTimeout(() => {
+        controller.abort();
+      }, timeoutMs)
     : undefined;
   try {
-    const res = await Promise.race([
-      fetch(`http://127.0.0.1:${port}${pathName}`, {
-        signal: controller.signal,
-      }),
-      ...(timeoutPromise ? [timeoutPromise] : []),
-    ]);
+    const res = await fetch(`http://127.0.0.1:${port}${pathName}`, {
+      signal: controller.signal,
+    });
     const status = { ok: res.ok, status: res.status, body: undefined, bodyText: undefined };
     if (parseJson) {
-      const text = await readBoundedResponseText(
-        res,
-        `${pathName} probe`,
-        HTTP_PROBE_BODY_MAX_BYTES,
-        { createTooLargeError: createBoundedResponseTooLargeError, timeoutPromise },
-      );
+      const text = await res.text();
       status.bodyText = text;
       if (text.trim()) {
         try {
@@ -724,18 +705,16 @@ export async function httpOk(port, pathName, options = {}) {
   }
 }
 
-async function assertHttpOk(port, pathName, { parseJson = false, acceptDegraded } = {}) {
+async function assertHttpOk(port, pathName) {
   const started = Date.now();
   let lastError;
   while (Date.now() - started < RPC_READY_TIMEOUT_MS) {
     try {
-      const res = await fetchHttpProbeStatus(port, pathName, { parseJson });
-      if (res.ok || acceptDegraded?.(res)) {
+      const res = await fetchHttpProbeStatus(port, pathName);
+      if (res.ok) {
         return;
       }
-      lastError = new Error(
-        `${pathName} returned HTTP ${res.status}${parseJson ? `: ${formatHttpProbeBody(res)}` : ""}`,
-      );
+      lastError = new Error(`${pathName} returned HTTP ${res.status}`);
     } catch (error) {
       lastError = error;
     }
@@ -776,7 +755,7 @@ function formatHttpProbeBody(res) {
   if (res.body !== undefined) {
     return JSON.stringify(res.body);
   }
-  const text = res.bodyText?.trim() ?? "";
+  const text = typeof res.bodyText === "string" ? res.bodyText.trim() : "";
   if (!text) {
     return "null";
   }
@@ -785,20 +764,32 @@ function formatHttpProbeBody(res) {
 
 export async function assertReadyzProbe(options) {
   const allowedFailures = new Set(options.allowedDegradedReadyzFailures ?? []);
-  await assertHttpOk(options.port, "/readyz", {
-    parseJson: true,
-    acceptDegraded(res) {
-      if (!isAllowedDegradedReadyz(res, allowedFailures)) {
-        return false;
+  const started = Date.now();
+  let lastError;
+  while (Date.now() - started < RPC_READY_TIMEOUT_MS) {
+    try {
+      const res = await fetchHttpProbeStatus(options.port, "/readyz", { parseJson: true });
+      if (res.ok) {
+        return;
       }
-      console.log(
-        `Runtime readyz smoke degraded for ${options.pluginId}: /readyz failing ${JSON.stringify(
-          listReadyzFailingComponents(res.body),
-        )}`,
-      );
-      return true;
-    },
-  });
+      if (isAllowedDegradedReadyz(res, allowedFailures)) {
+        console.log(
+          `Runtime readyz smoke degraded for ${options.pluginId}: /readyz failing ${JSON.stringify(
+            listReadyzFailingComponents(res.body),
+          )}`,
+        );
+        return;
+      }
+      lastError = new Error(`/readyz returned HTTP ${res.status}: ${formatHttpProbeBody(res)}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(Math.min(500, Math.max(1, RPC_READY_TIMEOUT_MS - (Date.now() - started))));
+  }
+  throw toLintErrorObject(
+    lastError ?? new Error("/readyz did not return HTTP 200"),
+    "Non-Error thrown",
+  );
 }
 
 export async function rpcCall(method, params, options) {
@@ -870,76 +861,82 @@ function parseJsonOutput(stdout) {
   if (!trimmed) {
     throw new Error("gateway call produced no JSON output");
   }
-  const parsed = parseJsonValue(trimmed);
-  if (parsed.ok) {
-    return parsed.value;
-  }
-
-  let lastParsed;
-  const lines = trimmed.split(/\r?\n/u);
-  for (let start = lines.length - 1; start >= 0; start -= 1) {
-    if (!lines[start].trimStart().startsWith("{")) {
-      continue;
-    }
-    let candidate = "";
-    for (let end = start; end < lines.length; end += 1) {
-      candidate = candidate ? `${candidate}\n${lines[end]}` : lines[end];
-      const candidateParsed = parseJsonValue(candidate);
-      if (!candidateParsed.ok) {
-        continue;
-      }
-      lastParsed ??= candidateParsed.value;
-      if (isGatewayJsonOutput(candidateParsed.value)) {
-        return candidateParsed.value;
-      }
-      break;
-    }
-  }
-  if (lastParsed !== undefined) {
-    return lastParsed;
-  }
-  throw new Error(`gateway call JSON output was not parseable:\n${trimmed}`);
-}
-
-function parseJsonValue(text) {
   try {
-    return { ok: true, value: JSON.parse(text) };
+    return JSON.parse(trimmed);
   } catch {
-    return { ok: false };
+    const jsonStart = trimmed.indexOf("{");
+    if (jsonStart >= 0) {
+      try {
+        return JSON.parse(trimmed.slice(jsonStart));
+      } catch {
+        // Fall through to the line-oriented fallback below.
+      }
+    }
+    const jsonLine = trimmed
+      .split(/\r?\n/u)
+      .toReversed()
+      .find((line) => line.trim().startsWith("{"));
+    if (!jsonLine) {
+      throw new Error(`gateway call JSON output was not parseable:\n${trimmed}`);
+    }
+    return JSON.parse(jsonLine);
   }
 }
 
-function isGatewayJsonOutput(raw) {
+function hasOwnPayloadField(raw, field) {
   return (
-    raw.ok === false || ["result", "payload", "data"].some((field) => Object.hasOwn(raw, field))
+    ((typeof raw === "object" && raw !== null) || typeof raw === "function") &&
+    Object.hasOwn(raw, field)
   );
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function unwrapRpcPayload(raw) {
   if (raw?.ok === false) {
     throw new Error(`gateway RPC failed: ${JSON.stringify(raw.error ?? raw)}`);
   }
-  return resolveGatewayCliPayload(raw);
+  if (hasOwnPayloadField(raw, "result")) {
+    return raw.result;
+  }
+  if (hasOwnPayloadField(raw, "payload")) {
+    return raw.payload;
+  }
+  if (hasOwnPayloadField(raw, "data")) {
+    return raw.data;
+  }
+  return raw;
 }
 
 export function assertGatewayHealthPayload(payload, label = "health") {
   if (!isRecord(payload)) {
     throw new Error(`${label} returned invalid payload: expected object.`);
   }
-  const checks = [
-    [payload.ok === true, "ok=true"],
-    [Number.isFinite(payload.ts), "numeric ts"],
-    [Number.isFinite(payload.durationMs), "numeric durationMs"],
-    [isNonEmptyString(payload.defaultAgentId), "defaultAgentId"],
-    [Array.isArray(payload.agents), "agents array"],
-    [isRecord(payload.channels), "channels object"],
-    [Array.isArray(payload.channelOrder), "channelOrder array"],
-    [isRecord(payload.sessions), "sessions object"],
-  ];
-  for (const [passed, expected] of checks) {
-    if (!passed) {
-      throw new Error(`${label} returned invalid payload: expected ${expected}.`);
-    }
+  if (payload.ok !== true) {
+    throw new Error(`${label} returned invalid payload: expected ok=true.`);
+  }
+  if (!Number.isFinite(payload.ts)) {
+    throw new Error(`${label} returned invalid payload: expected numeric ts.`);
+  }
+  if (!Number.isFinite(payload.durationMs)) {
+    throw new Error(`${label} returned invalid payload: expected numeric durationMs.`);
+  }
+  if (typeof payload.defaultAgentId !== "string" || payload.defaultAgentId.trim() === "") {
+    throw new Error(`${label} returned invalid payload: expected defaultAgentId.`);
+  }
+  if (!Array.isArray(payload.agents)) {
+    throw new Error(`${label} returned invalid payload: expected agents array.`);
+  }
+  if (!isRecord(payload.channels)) {
+    throw new Error(`${label} returned invalid payload: expected channels object.`);
+  }
+  if (!Array.isArray(payload.channelOrder)) {
+    throw new Error(`${label} returned invalid payload: expected channelOrder array.`);
+  }
+  if (!isRecord(payload.sessions)) {
+    throw new Error(`${label} returned invalid payload: expected sessions object.`);
   }
 }
 
@@ -954,7 +951,8 @@ async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, plu
   }
   const manifest = loadManifest(pluginDir, pluginRoot);
   const plan = buildPluginPlan(manifest);
-  const port = resolveRuntimeSmokePort(pluginIndex);
+  const port =
+    readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE", 19000) + pluginIndex * 3;
   const config = ensureGatewayConfig(
     activateSmokePlugin(readConfig(), pluginId, plan.channels),
     port,
@@ -962,14 +960,16 @@ async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, plu
   const env = withManifestChannelActivationEnv(process.env, plan.channels);
   if (plan.speechProviders[0]) {
     const provider = plan.speechProviders[0];
-    const existingTts = config.tts;
-    config.tts = {
-      ...existingTts,
-      provider,
-      providers: {
-        ...existingTts?.providers,
-        [provider]: {
-          ...existingTts?.providers?.[provider],
+    config.messages = {
+      ...config.messages,
+      tts: {
+        ...config.messages?.tts,
+        provider,
+        providers: {
+          ...config.messages?.tts?.providers,
+          [provider]: {
+            ...config.messages?.tts?.providers?.[provider],
+          },
         },
       },
     };
@@ -977,45 +977,30 @@ async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, plu
   writeConfig(config);
 
   const logPath = `/tmp/openclaw-plugin-runtime-${pluginIndex}-${pluginId}.log`;
-  await runGatewaySmoke(
-    {
+  const child = startGateway({
+    entrypoint,
+    port,
+    logPath,
+    env,
+    skipChannels: plan.channels.length === 0,
+  });
+  try {
+    await waitForReady({ child, port, logPath });
+    await assertBaseGatewayProbes({
       entrypoint,
       port,
-      logPath,
       env,
       pluginId,
-      skipChannels: plan.channels.length === 0,
       allowedDegradedReadyzFailures: plan.channels,
-    },
-    async (options) => {
-      assertPluginLoaded(logPath, pluginId);
-      await assertBaseGatewayProbes(options);
-      await runManifestProbes(plan, options);
-    },
-    `Runtime smoke passed for ${pluginId}`,
-  );
-}
-
-async function runGatewaySmoke(initialOptions, probe, successMessage, isolatedState) {
-  let options = initialOptions;
-  if (isolatedState) {
-    const { label, config } = isolatedState;
-    const env = createIsolatedStateEnv(label);
-    writeConfig(ensureGatewayConfig(config, options.port), env);
-    options = { ...options, env };
-  }
-  const child = startGateway(options);
-  try {
-    await waitForReady({ ...options, child });
-    await probe(options);
-    await runWatchdog({ ...options, child });
-    console.log(successMessage);
+    });
+    await runManifestProbes(plan, { entrypoint, port, env, pluginId });
+    await runWatchdog({ child, logPath, port, entrypoint, env, pluginId });
+    console.log(`Runtime smoke passed for ${pluginId}`);
   } catch (error) {
-    console.error(tailFile(options.logPath));
+    console.error(tailFile(logPath));
     throw error;
   } finally {
     await stopGateway(child);
-    cleanupIsolatedStateEnv(options.env);
   }
 }
 
@@ -1060,12 +1045,19 @@ async function runManifestProbes(plan, options) {
   }
 }
 
-export function assertChannelVisible(payload, channel, pluginId) {
+function isChannelVisible(payload, channel) {
   const channelMeta = payload.channelMeta;
   const hasMeta = Array.isArray(channelMeta)
     ? channelMeta.some((entry) => entry?.id === channel)
     : Boolean(channelMeta?.[channel]);
   if (hasMeta || payload.channels?.[channel] || payload.channelAccounts?.[channel]) {
+    return true;
+  }
+  return false;
+}
+
+export function assertChannelVisible(payload, channel, pluginId) {
+  if (isChannelVisible(payload, channel)) {
     return;
   }
   throw new Error(
@@ -1157,6 +1149,10 @@ async function runWatchdog(options) {
   await assertNoPackageManagerChildren(options.child.pid);
 }
 
+export function findReadyLogOffset(logPath) {
+  return findFirstNeedleOffset(logPath, READY_OFFSET_LOG_NEEDLES);
+}
+
 export function assertGatewayLogNotTruncated(logPath) {
   if (readFileTail(logPath).includes(GATEWAY_LOG_TRUNCATED_NEEDLE)) {
     throw new Error(
@@ -1164,19 +1160,6 @@ export function assertGatewayLogNotTruncated(logPath) {
         GATEWAY_LOG_CAPTURE_BYTES,
       )} bytes; runtime smoke cannot validate complete post-ready output`,
     );
-  }
-}
-
-export function assertPluginLoaded(logPath, pluginId) {
-  let text;
-  try {
-    text = fs.readFileSync(logPath, "utf8");
-  } catch {
-    return;
-  }
-  const failurePrefix = `[plugins] ${pluginId} failed to load`;
-  if (text.includes(failurePrefix)) {
-    throw new Error(`${failurePrefix}: ${tailText(text)}`);
   }
 }
 
@@ -1194,7 +1177,7 @@ export function assertNoPostReadyRuntimeDepsWork(logPath, readyOffset) {
   let offset = Math.min(Math.max(0, Math.floor(Number(readyOffset) || 0)), stat.size);
   let carry = "";
   while (offset < stat.size) {
-    const buffer = readFileChunk(logPath, offset, LOG_SCAN_BYTES);
+    const { buffer } = readFileChunk(logPath, offset, LOG_SCAN_BYTES);
     if (buffer.length === 0) {
       break;
     }
@@ -1209,7 +1192,7 @@ export function assertNoPostReadyRuntimeDepsWork(logPath, readyOffset) {
 }
 
 function commandIncludesPackageManager(args) {
-  return args
+  return String(args ?? "")
     .trim()
     .split(/\s+/u)
     .some((token) =>
@@ -1219,6 +1202,22 @@ function commandIncludesPackageManager(args) {
     );
 }
 
+function parseProcessSnapshot(stdout) {
+  const processes = [];
+  for (const line of String(stdout ?? "").split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/u.exec(line);
+    if (!match) {
+      continue;
+    }
+    processes.push({
+      args: match[3],
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+    });
+  }
+  return processes;
+}
+
 export function findPackageManagerDescendants(psOutput, rootPid) {
   const root = Number(rootPid);
   if (!Number.isInteger(root) || root <= 0) {
@@ -1226,16 +1225,7 @@ export function findPackageManagerDescendants(psOutput, rootPid) {
   }
 
   const childrenByParent = new Map();
-  for (const line of String(psOutput ?? "").split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/u.exec(line);
-    if (!match) {
-      continue;
-    }
-    const processInfo = {
-      args: match[3],
-      pid: Number(match[1]),
-      ppid: Number(match[2]),
-    };
+  for (const processInfo of parseProcessSnapshot(psOutput)) {
     const list = childrenByParent.get(processInfo.ppid) ?? [];
     list.push(processInfo);
     childrenByParent.set(processInfo.ppid, list);
@@ -1246,7 +1236,7 @@ export function findPackageManagerDescendants(psOutput, rootPid) {
   const seen = new Set();
   while (pending.length > 0) {
     const current = pending.shift();
-    if (seen.has(current.pid)) {
+    if (!current || seen.has(current.pid)) {
       continue;
     }
     seen.add(current.pid);
@@ -1294,34 +1284,48 @@ async function smokeTtsGlobalDisable(pluginId, pluginDir, provider, pluginIndex,
     console.log(`Global-disable TTS smoke skipped for ${pluginId}: no speech provider contract`);
     return;
   }
-  const port = resolveRuntimeSmokePort(pluginIndex, 1);
-  const logPath = `/tmp/openclaw-plugin-runtime-${pluginIndex}-${pluginId}-tts-disabled.log`;
-  await runGatewaySmoke(
-    {
-      logPath,
-      port,
-      entrypoint,
-      skipChannels: true,
-      pluginId: `${pluginId}:tts-disabled`,
-    },
-    async (options) => {
-      await assertBaseGatewayProbes(options);
-      const providers = await retryRpcCall("tts.providers", {}, options);
-      assertSpeechProviderVisible(providers, selectedProvider, "tts.providers global-disable");
-    },
-    `Global-disable TTS smoke passed for ${pluginId}/${selectedProvider}`,
-    {
-      label: `tts-disabled-${pluginId}`,
-      config: {
+  const port =
+    readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE", 19000) + pluginIndex * 3 + 1;
+  const env = createIsolatedStateEnv(`tts-disabled-${pluginId}`);
+  writeConfig(
+    ensureGatewayConfig(
+      {
         plugins: {
           enabled: false,
         },
-        tts: {
-          provider: selectedProvider,
+        messages: {
+          tts: {
+            provider: selectedProvider,
+          },
         },
       },
-    },
+      port,
+    ),
+    env,
   );
+  const logPath = `/tmp/openclaw-plugin-runtime-${pluginIndex}-${pluginId}-tts-disabled.log`;
+  const child = startGateway({ entrypoint, port, logPath, env, skipChannels: true });
+  try {
+    await waitForReady({ child, port, logPath });
+    await assertBaseGatewayProbes({ entrypoint, port, env });
+    const providers = await retryRpcCall("tts.providers", {}, { entrypoint, port, env });
+    assertSpeechProviderVisible(providers, selectedProvider, "tts.providers global-disable");
+    await runWatchdog({
+      child,
+      logPath,
+      port,
+      entrypoint,
+      env,
+      pluginId: `${pluginId}:tts-disabled`,
+    });
+    console.log(`Global-disable TTS smoke passed for ${pluginId}/${selectedProvider}`);
+  } catch (error) {
+    console.error(tailFile(logPath));
+    throw error;
+  } finally {
+    await stopGateway(child);
+    cleanupIsolatedStateEnv(env);
+  }
 }
 
 async function smokeOpenAiTts(pluginIndex) {
@@ -1333,21 +1337,12 @@ async function smokeOpenAiTts(pluginIndex) {
     console.log("OpenAI key-backed TTS smoke skipped: OPENAI_API_KEY is not set");
     return;
   }
-  const port = resolveRuntimeSmokePort(pluginIndex, 2);
-  const logPath = `/tmp/openclaw-plugin-runtime-${pluginIndex}-openai-tts-live.log`;
-  await runGatewaySmoke(
-    { entrypoint, port, logPath, skipChannels: true, pluginId: "openai:tts-live" },
-    async (options) => {
-      await assertBaseGatewayProbes(options);
-      const result = await retryRpcCall("tts.convert", { text: "ok", provider: "openai" }, options);
-      if (!isNonEmptyString(result.audioPath) || !fs.existsSync(result.audioPath)) {
-        throw new Error(`tts.convert did not produce an audio file: ${JSON.stringify(result)}`);
-      }
-    },
-    "OpenAI key-backed TTS smoke passed",
-    {
-      label: "tts-openai-live",
-      config: {
+  const port =
+    readPositiveIntEnv("OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE", 19000) + pluginIndex * 3 + 2;
+  const env = createIsolatedStateEnv("tts-openai-live");
+  writeConfig(
+    ensureGatewayConfig(
+      {
         plugins: {
           enabled: true,
           allow: ["openai"],
@@ -1355,17 +1350,43 @@ async function smokeOpenAiTts(pluginIndex) {
             openai: { enabled: true },
           },
         },
-        tts: {
-          provider: "openai",
-          providers: {
-            openai: {
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
+        messages: {
+          tts: {
+            provider: "openai",
+            providers: {
+              openai: {
+                apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
+              },
             },
           },
         },
       },
-    },
+      port,
+    ),
+    env,
   );
+  const logPath = `/tmp/openclaw-plugin-runtime-${pluginIndex}-openai-tts-live.log`;
+  const child = startGateway({ entrypoint, port, logPath, env, skipChannels: true });
+  try {
+    await waitForReady({ child, port, logPath });
+    await assertBaseGatewayProbes({ entrypoint, port, env });
+    const result = await retryRpcCall(
+      "tts.convert",
+      { text: "ok", provider: "openai" },
+      { entrypoint, port, env },
+    );
+    if (!isNonEmptyString(result.audioPath) || !fs.existsSync(result.audioPath)) {
+      throw new Error(`tts.convert did not produce an audio file: ${JSON.stringify(result)}`);
+    }
+    await runWatchdog({ child, logPath, port, entrypoint, env, pluginId: "openai:tts-live" });
+    console.log("OpenAI key-backed TTS smoke passed");
+  } catch (error) {
+    console.error(tailFile(logPath));
+    throw error;
+  } finally {
+    await stopGateway(child);
+    cleanupIsolatedStateEnv(env);
+  }
 }
 
 export function createIsolatedStateEnv(label) {
@@ -1403,10 +1424,10 @@ function tailText(text) {
   return text.split(/\r?\n/u).slice(-120).join("\n");
 }
 
-async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2)) {
   const [command, pluginId, pluginDir, requiresConfigRaw, pluginIndexRaw, pluginRoot, provider] =
     argv;
-  const pluginIndex = readInteger(pluginIndexRaw, 0, "bundled plugin runtime index", 0);
+  const pluginIndex = Number.parseInt(pluginIndexRaw || "0", 10);
 
   if (command === "plugin") {
     await smokePlugin(pluginId, pluginDir, requiresConfigRaw === "1", pluginIndex, pluginRoot);
@@ -1421,4 +1442,18 @@ async function main(argv = process.argv.slice(2)) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await main();
+}
+
+function toLintErrorObject(value, fallbackMessage) {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
 }

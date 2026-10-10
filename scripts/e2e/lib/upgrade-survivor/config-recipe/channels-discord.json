@@ -5,8 +5,10 @@
     "provider": "default",
     "id": "DISCORD_BOT_TOKEN"
   },
-  "dmPolicy": "allowlist",
-  "allowFrom": ["111111111111111111"],
+  "dm": {
+    "policy": "allowlist",
+    "allowFrom": ["111111111111111111"]
+  },
   "groupPolicy": "allowlist",
   "guilds": {
     "222222222222222222": {

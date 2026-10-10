@@ -1,7 +1,6 @@
+// Sync Plugin Versions script supports OpenClaw repository automation.
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { parse as parseSemver } from "semver";
-import { compareOpenClawSemver } from "../src/infra/semver.js";
 
 type PackageJson = {
   name?: string;
@@ -26,38 +25,52 @@ type SyncPluginVersionsOptions = {
 };
 
 const OPENCLAW_VERSION_RANGE_RE = /^>=\d{4}\.\d{1,2}\.\d{1,2}(?:[-.][^"\s]+)?$/u;
-const VERSION_ALIGNED_PACKAGE_DIRS = [
-  "packages/ai",
-  "packages/gateway-client",
-  "packages/gateway-protocol",
-] as const;
 
-function syncVersionRange(
-  fields: Record<string, string | undefined> | undefined,
-  key: string,
+function syncOpenClawDependencyRange(
+  deps: Record<string, string> | undefined,
   targetVersion: string,
 ): boolean {
-  const current = fields?.[key];
+  const current = deps?.openclaw;
+  if (!current || current === "workspace:*" || !OPENCLAW_VERSION_RANGE_RE.test(current)) {
+    return false;
+  }
+  const next = `>=${targetVersion}`;
+  if (current === next) {
+    return false;
+  }
+  deps.openclaw = next;
+  return true;
+}
+
+function syncPluginApiVersion(pkg: PackageJson, targetVersion: string): boolean {
+  const compat = pkg.openclaw?.compat;
+  const current = compat?.pluginApi;
   if (!current || !OPENCLAW_VERSION_RANGE_RE.test(current)) {
     return false;
   }
-  const currentVersion = parseSemver(current.slice(2));
-  const nextVersion = parseSemver(targetVersion);
-  if (!currentVersion || !nextVersion || compareOpenClawSemver(nextVersion, currentVersion) <= 0) {
+  const next = `>=${targetVersion}`;
+  if (current === next) {
     return false;
   }
-  fields[key] = `>=${targetVersion}`;
+  compat.pluginApi = next;
   return true;
 }
 
 function syncBuildOpenClawVersion(pkg: PackageJson, targetVersion: string): boolean {
   const build = pkg.openclaw?.build;
   const current = build?.openclawVersion;
-  if (!current || current === targetVersion) {
+  if (!current) {
+    return false;
+  }
+  if (current === targetVersion) {
     return false;
   }
   build.openclawVersion = targetVersion;
   return true;
+}
+
+function changelogVersionForPackageVersion(version: string): string {
+  return version.replace(/-beta\.\d+$/u, "");
 }
 
 function ensureChangelogEntry(changelogPath: string, version: string, write: boolean): boolean {
@@ -69,11 +82,16 @@ function ensureChangelogEntry(changelogPath: string, version: string, write: boo
     return false;
   }
   const entry = `## ${version}\n\n### Changes\n- Version alignment with core OpenClaw release numbers.\n\n`;
-  const next = content.startsWith("# Changelog\n\n")
-    ? content.replace("# Changelog\n\n", `# Changelog\n\n${entry}`)
-    : `# Changelog\n\n${entry}${content.trimStart()}\n`;
+  if (content.startsWith("# Changelog\n\n")) {
+    const next = content.replace("# Changelog\n\n", `# Changelog\n\n${entry}`);
+    if (write) {
+      writeFileSync(changelogPath, next);
+    }
+    return true;
+  }
+  const next = `# Changelog\n\n${entry}${content.trimStart()}`;
   if (write) {
-    writeFileSync(changelogPath, next);
+    writeFileSync(changelogPath, `${next}\n`);
   }
   return true;
 }
@@ -99,22 +117,6 @@ export function syncPluginVersions(
   const changelogged: string[] = [];
   const skipped: string[] = [];
 
-  for (const packageDir of VERSION_ALIGNED_PACKAGE_DIRS) {
-    const packagePath = join(rootDir, packageDir, "package.json");
-    if (!existsSync(packagePath)) {
-      continue;
-    }
-    const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as PackageJson;
-    if (!pkg.name || pkg.version === targetVersion) {
-      continue;
-    }
-    pkg.version = targetVersion;
-    if (write) {
-      writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
-    }
-    updated.push(pkg.name);
-  }
-
   for (const dir of dirs) {
     const packagePath = join(extensionsDir, dir.name, "package.json");
     let pkg: PackageJson;
@@ -130,17 +132,17 @@ export function syncPluginVersions(
     }
 
     const changelogPath = join(extensionsDir, dir.name, "CHANGELOG.md");
-    const changelogVersion = targetVersion.replace(/-beta\.\d+$/u, "");
+    const changelogVersion = changelogVersionForPackageVersion(targetVersion);
     if (ensureChangelogEntry(changelogPath, changelogVersion, write)) {
       changelogged.push(pkg.name);
     }
 
     const versionChanged = pkg.version !== targetVersion;
-    const devDependencyChanged = syncVersionRange(pkg.devDependencies, "openclaw", targetVersion);
-    const peerDependencyChanged = syncVersionRange(pkg.peerDependencies, "openclaw", targetVersion);
+    const devDependencyChanged = syncOpenClawDependencyRange(pkg.devDependencies, targetVersion);
+    const peerDependencyChanged = syncOpenClawDependencyRange(pkg.peerDependencies, targetVersion);
     // minHostVersion is a compatibility floor, not release alignment metadata.
     // Keep it stable unless the owning plugin intentionally raises it.
-    const pluginApiChanged = syncVersionRange(pkg.openclaw?.compat, "pluginApi", targetVersion);
+    const pluginApiChanged = syncPluginApiVersion(pkg, targetVersion);
     const buildOpenClawVersionChanged = syncBuildOpenClawVersion(pkg, targetVersion);
     const packageChanged =
       versionChanged ||

@@ -1,29 +1,16 @@
 #!/usr/bin/env -S pnpm tsx
-import { spawn } from "node:child_process";
 // Npm Update Smoke script supports OpenClaw repository automation.
-import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { copyFile, readFile, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
-  addTimerTimeoutGraceMs,
-  clampTimerTimeoutMs,
-  finiteSecondsToTimerSafeMilliseconds,
-} from "@openclaw/normalization-core/number-coercion";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { readStringValue } from "@openclaw/normalization-core/string-coerce";
-import { stripLeadingPackageManagerSeparator } from "../../lib/arg-utils.mts";
-import { resolveProviderConfig } from "../../lib/cross-os-release-checks/config.ts";
-import { formatDurationElapsed } from "../../lib/format-duration.mts";
-import {
   die,
   ensureValue,
-  extractPackageJsonFromTgz,
   extractLastOpenClawVersionFromLog,
   makeTempDir,
   packOpenClaw,
-  packageBuildCommitFromTgz,
   parsePlatformList,
   parseProvider,
   readPositiveIntEnv,
@@ -36,39 +23,26 @@ import {
   run,
   say,
   shellQuote,
+  startHostServer,
   withProgressOnStderr,
   writeSummaryMarkdown,
   writeJson,
   type HostServer,
-  type NpmRegistryPackage,
   type PackageArtifact,
   type Platform,
   type Provider,
   type ProviderAuth,
 } from "./common.ts";
 import { runWindowsBackgroundPowerShell } from "./guest-transports.ts";
-import { resolveMacosPrlctlInvocation, runMacosHostCommand } from "./macos-exec.ts";
-import { resolveMacosDesktopHome, resolveMacosDesktopUser } from "./macos-users.ts";
 import { linuxUpdateScript, macosUpdateScript, windowsUpdateScript } from "./npm-update-scripts.ts";
-import { ensureVmRunning, resolveMacosVmName, resolveUbuntuVmName } from "./parallels-vm.ts";
-import { runParallelsPrerequisiteEval } from "./provider-auth-prerequisite.mjs";
-import { expectedPackageTargetVersion, startSmokeArtifactServer } from "./smoke-common.ts";
+import { ensureVmRunning, resolveUbuntuVmName } from "./parallels-vm.ts";
 import { runTimedUpdateJob } from "./update-job-timeout.ts";
-
-const LOGGED_PROCESS_TREE_EXIT_POLL_MS = 25;
-const LOGGED_POST_FORCE_KILL_WAIT_MS = 1_000;
 
 interface NpmUpdateOptions {
   betaValidation?: string;
-  dependencyTarballs: string[];
-  registryPackageTarballs: string[];
   freshTargetSpec?: string;
   hostIp?: string;
-  macosSnapshotHint?: string;
-  macosVm?: string;
-  windowsVm?: string;
   packageSpec: string;
-  targetTarball?: string;
   updateTarget: string;
   platforms: Set<Platform>;
   provider: Provider;
@@ -85,15 +59,14 @@ interface Job {
   lastOutputAt: number;
   lastPhase: string;
   logPath: string;
-  platform: Platform;
   promise: Promise<number>;
-  retry?: () => Job;
   rerunCommand: string;
   startedAt: number;
 }
 
 interface UpdateJobContext {
   append(chunk: string | Uint8Array): void;
+  logPath: string;
   signal: AbortSignal;
 }
 
@@ -103,67 +76,54 @@ interface SpawnLoggedOptions {
   timeoutMs?: number;
 }
 
-interface MacosUpdateExec {
-  execArgs: string[];
-  ownerUser: string;
+interface NpmUpdateSummary {
+  packageSpec: string;
+  updateTarget: string;
+  updateExpected: string;
+  updateTargetBuildCommit: string;
+  updateTargetPackageVersion: string;
+  updateTargetTarball: string;
+  provider: Provider;
+  latestVersion: string;
+  currentHead: string;
+  harnessCheckoutVersion: string;
+  harnessTargetFamily: string;
+  runDir: string;
+  slowestTiming?: {
+    durationMs: number;
+    label: string;
+    phase: "fresh" | "fresh-target" | "update";
+  };
+  totalDurationMs: number;
+  fresh: Record<Platform, string>;
+  freshTarget: Record<Platform, string>;
+  freshTargetSpec: string;
+  update: Record<Platform, { status: string; version: string }>;
+  timings: Array<{
+    durationMs: number;
+    label: string;
+    logPath: string;
+    phase: "fresh" | "fresh-target" | "update";
+    status: string;
+  }>;
 }
 
-interface JobTiming {
-  durationMs: number;
-  label: string;
-  logPath: string;
-  phase: "fresh" | "fresh-target" | "update";
-  status: string;
-}
-
-const macosVmDefault = "macOS Tahoe";
-const windowsVmDefault = "Windows 11";
+const macosVm = "macOS Tahoe";
+const windowsVm = "Windows 11";
 const linuxVmDefault = "Ubuntu 26.04";
-
-function resolveRequiredTimerMs(timeoutMs: number): number {
-  return clampTimerTimeoutMs(timeoutMs) ?? 1;
-}
-
-function resolveOptionalTimerMs(timeoutMs: number | undefined): number | undefined {
-  return timeoutMs === undefined || timeoutMs <= 0 ? undefined : resolveRequiredTimerMs(timeoutMs);
-}
-
-function resolveSecondsTimerMs(timeoutSeconds: number): number {
-  return finiteSecondsToTimerSafeMilliseconds(timeoutSeconds) ?? 1;
-}
-
+const updateTimeoutSeconds = readPositiveIntEnv("OPENCLAW_PARALLELS_NPM_UPDATE_TIMEOUT_S", 1200);
 const updateCleanupBackstopMs = 60_000;
-type UpdateTimeouts = { seconds: number; timeoutMs: number; withCleanupMs: number };
-let cachedUpdateTimeouts: UpdateTimeouts | undefined;
-let cachedFreshLaneTimeoutKillGraceMs: number | undefined;
-
-function resolveUpdateTimeouts(): UpdateTimeouts {
-  return (cachedUpdateTimeouts ??= (() => {
-    const seconds = readPositiveIntEnv("OPENCLAW_PARALLELS_NPM_UPDATE_TIMEOUT_S", 2700);
-    const timeoutMs = resolveSecondsTimerMs(seconds);
-    return {
-      seconds,
-      timeoutMs,
-      withCleanupMs: addTimerTimeoutGraceMs(timeoutMs, updateCleanupBackstopMs) ?? 1,
-    };
-  })());
-}
-
-function resolveFreshLaneTimeoutKillGraceMs(): number {
-  return (cachedFreshLaneTimeoutKillGraceMs ??= readPositiveIntEnv(
-    "OPENCLAW_PARALLELS_NPM_UPDATE_FRESH_TIMEOUT_KILL_GRACE_MS",
-    2_000,
-  ));
-}
+const freshLaneTimeoutKillGraceMs = readPositiveIntEnv(
+  "OPENCLAW_PARALLELS_NPM_UPDATE_FRESH_TIMEOUT_KILL_GRACE_MS",
+  2_000,
+);
 const activeLoggedChildren = new Set<ReturnType<typeof spawn>>();
 const loggedParentSignalHandlers = new Map<NodeJS.Signals, () => void>();
 let loggedExitCleanupInstalled = false;
 
 export function freshLaneTimeoutMs(platform: Platform): number {
   const defaultSeconds = platform === "windows" ? 90 * 60 : 75 * 60;
-  return resolveSecondsTimerMs(
-    readPositiveIntEnv("OPENCLAW_PARALLELS_NPM_UPDATE_FRESH_TIMEOUT_S", defaultSeconds),
-  );
+  return readPositiveIntEnv("OPENCLAW_PARALLELS_NPM_UPDATE_FRESH_TIMEOUT_S", defaultSeconds) * 1000;
 }
 
 export function spawnLoggedCommand(
@@ -186,28 +146,22 @@ export function spawnLoggedCommand(
     let timedOut = false;
     let settled = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
-    let forceKillAt: number | undefined;
     const append = (text: string) => {
       appendFileSync(logPath, text, "utf8");
       onOutput(text);
     };
-    const timeoutMs = resolveOptionalTimerMs(options.timeoutMs);
-    const timeoutKillGraceMs =
-      options.timeoutKillGraceMs === undefined
-        ? resolveRequiredTimerMs(resolveFreshLaneTimeoutKillGraceMs())
-        : resolveRequiredTimerMs(options.timeoutKillGraceMs);
+    const timeoutMs = options.timeoutMs ?? 0;
     const timeoutTimer =
-      timeoutMs !== undefined
+      timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
             append(
               `\n[${options.timeoutLabel ?? `${command} ${args.join(" ")}`} timed out after ${timeoutMs}ms]\n`,
             );
             signalLoggedChild(child, "SIGTERM");
-            forceKillAt = Date.now() + timeoutKillGraceMs;
             forceKillTimer = setTimeout(
               () => signalLoggedChild(child, "SIGKILL"),
-              timeoutKillGraceMs,
+              options.timeoutKillGraceMs ?? freshLaneTimeoutKillGraceMs,
             );
           }, timeoutMs)
         : undefined;
@@ -234,19 +188,11 @@ export function spawnLoggedCommand(
       settled = true;
       clearTimeout(timeoutTimer);
       clearTimeout(forceKillTimer);
-      const finish = () => {
-        forceKillAt = undefined;
-        untrackLoggedChild(child);
-        resolve(timedOut ? 124 : (code ?? 1));
-      };
-      if (timedOut) {
-        void finishTimedOutLoggedProcessTree(child, {
-          forceKillAt,
-          timeoutKillGraceMs,
-        }).then(finish, finish);
-        return;
+      if (timedOut && loggedProcessTreeIsAlive(child)) {
+        signalLoggedChild(child, "SIGKILL");
       }
-      finish();
+      untrackLoggedChild(child);
+      resolve(timedOut ? 124 : (code ?? 1));
     });
   });
 }
@@ -315,43 +261,6 @@ function loggedProcessTreeIsAlive(child: ReturnType<typeof spawn>): boolean {
   }
 }
 
-async function waitForLoggedProcessTreeExit(
-  child: ReturnType<typeof spawn>,
-  timeoutMs: number,
-): Promise<boolean> {
-  const deadlineAt = Date.now() + timeoutMs;
-  while (Date.now() < deadlineAt) {
-    if (!loggedProcessTreeIsAlive(child)) {
-      return true;
-    }
-    await new Promise((resolvePoll) => {
-      setTimeout(resolvePoll, LOGGED_PROCESS_TREE_EXIT_POLL_MS);
-    });
-  }
-  return !loggedProcessTreeIsAlive(child);
-}
-
-async function finishTimedOutLoggedProcessTree(
-  child: ReturnType<typeof spawn>,
-  {
-    forceKillAt,
-    timeoutKillGraceMs,
-  }: { forceKillAt: number | undefined; timeoutKillGraceMs: number },
-): Promise<void> {
-  if (!loggedProcessTreeIsAlive(child)) {
-    return;
-  }
-  const graceRemainingMs =
-    forceKillAt === undefined ? timeoutKillGraceMs : Math.max(0, forceKillAt - Date.now());
-  if (graceRemainingMs > 0) {
-    await waitForLoggedProcessTreeExit(child, graceRemainingMs);
-  }
-  if (loggedProcessTreeIsAlive(child)) {
-    signalLoggedChild(child, "SIGKILL");
-  }
-  await waitForLoggedProcessTreeExit(child, LOGGED_POST_FORCE_KILL_WAIT_MS);
-}
-
 function signalLoggedChild(child: ReturnType<typeof spawn>, signal: NodeJS.Signals) {
   if (process.platform !== "win32" && typeof child.pid === "number") {
     try {
@@ -379,27 +288,18 @@ Options:
   --package-spec <npm-spec>  Baseline npm package spec. Default: openclaw@latest
   --update-target <target>    Target passed to guest 'openclaw update --tag'.
                              Default: host-served tgz packed from current checkout.
-  --target-tarball <path>     Host-serve this prepared tgz for update and fresh install.
-  --dependency-tarball <path> Companion package tgz required by the target. Repeatable.
-  --registry-package-tarball <path>
-                             Additional package tgz served by the candidate registry. Repeatable.
   --fresh-target <npm-spec>   Also run fresh install smoke for this package after update lanes.
   --beta-validation [target]  Resolve a beta tag/alias/version, then run latest->target update
                              plus fresh target install. Default target when flag is bare: beta.
                              Aliases like beta3 resolve to the latest *-beta.3 version.
   --platform <list>           Comma-separated platforms to run: all, macos, windows, linux.
                              Default: all
-  --macos-vm <name>           Explicit Parallels macOS VM name.
-  --windows-vm <name>         Explicit Parallels Windows VM name.
-  --macos-snapshot-hint <hint>
-                             Snapshot name substring/fuzzy match passed to macOS fresh lanes.
   --provider <openai|anthropic|minimax>
   --model <provider/model>    Override the model used for agent-turn smoke checks.
   --host-ip <ip>             Override Parallels host IP.
   --api-key-env <var>        Host env var name for provider API key.
   --openai-api-key-env <var> Alias for --api-key-env (backward compatible)
   --json                     Print machine-readable JSON summary.
-  --prerequisite-check       Check provider credentials without starting smoke work. Requires --json.
   -h, --help                 Show help.
 `;
 }
@@ -409,50 +309,31 @@ export function parseArgs(argv: string[]): NpmUpdateOptions {
   const options: NpmUpdateOptions = {
     apiKeyEnv: undefined,
     betaValidation: undefined,
-    dependencyTarballs: [],
-    registryPackageTarballs: [],
     freshTargetSpec: undefined,
     json: false,
-    macosSnapshotHint: undefined,
-    macosVm: undefined,
-    windowsVm: undefined,
     modelId: undefined,
     packageSpec: "",
-    targetTarball: undefined,
     platforms: parsePlatformList("all"),
     provider: "openai",
     updateTarget: "",
   };
-  const valueHandlers: Record<string, (value: string) => void> = {
-    "--package-spec": (value) => (options.packageSpec = value),
-    "--update-target": (value) => (options.updateTarget = value),
-    "--target-tarball": (value) => (options.targetTarball = value),
-    "--dependency-tarball": (value) => options.dependencyTarballs.push(value),
-    "--registry-package-tarball": (value) => options.registryPackageTarballs.push(value),
-    "--fresh-target": (value) => (options.freshTargetSpec = value),
-    "--platform": (value) => (options.platforms = parsePlatformList(value)),
-    "--only": (value) => (options.platforms = parsePlatformList(value)),
-    "--macos-vm": (value) => (options.macosVm = value),
-    "--windows-vm": (value) => (options.windowsVm = value),
-    "--macos-snapshot-hint": (value) => (options.macosSnapshotHint = value),
-    "--provider": (value) => (options.provider = parseProvider(value)),
-    "--model": (value) => (options.modelId = value),
-    "--host-ip": (value) => (options.hostIp = value),
-    "--api-key-env": (value) => (options.apiKeyEnv = value),
-    "--openai-api-key-env": (value) => (options.apiKeyEnv = value),
-  };
   parseArgv: for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    const valueHandler =
-      arg !== undefined && Object.hasOwn(valueHandlers, arg) ? valueHandlers[arg] : undefined;
-    if (arg !== undefined && valueHandler) {
-      valueHandler(ensureValue(args, i, arg));
-      i++;
-      continue;
-    }
     switch (arg) {
       case "--":
         break parseArgv;
+      case "--package-spec":
+        options.packageSpec = ensureValue(args, i, arg);
+        i++;
+        break;
+      case "--update-target":
+        options.updateTarget = ensureValue(args, i, arg);
+        i++;
+        break;
+      case "--fresh-target":
+        options.freshTargetSpec = ensureValue(args, i, arg);
+        i++;
+        break;
       case "--beta-validation": {
         const next = args[i + 1];
         if (next && !next.startsWith("-")) {
@@ -463,6 +344,28 @@ export function parseArgs(argv: string[]): NpmUpdateOptions {
         }
         break;
       }
+      case "--platform":
+      case "--only":
+        options.platforms = parsePlatformList(ensureValue(args, i, arg));
+        i++;
+        break;
+      case "--provider":
+        options.provider = parseProvider(ensureValue(args, i, arg));
+        i++;
+        break;
+      case "--model":
+        options.modelId = ensureValue(args, i, arg);
+        i++;
+        break;
+      case "--host-ip":
+        options.hostIp = ensureValue(args, i, arg);
+        i++;
+        break;
+      case "--api-key-env":
+      case "--openai-api-key-env":
+        options.apiKeyEnv = ensureValue(args, i, arg);
+        i++;
+        break;
       case "--json":
         options.json = true;
         break;
@@ -474,21 +377,11 @@ export function parseArgs(argv: string[]): NpmUpdateOptions {
         die(`unknown arg: ${arg}`);
     }
   }
-  if (
-    options.targetTarball &&
-    (options.betaValidation || options.updateTarget || options.freshTargetSpec)
-  ) {
-    throw new Error(
-      "--target-tarball cannot be combined with --beta-validation, --update-target, or --fresh-target",
-    );
-  }
-  if (options.dependencyTarballs.length > 0 && !options.targetTarball) {
-    throw new Error("--dependency-tarball requires --target-tarball");
-  }
-  if (options.registryPackageTarballs.length > 0 && !options.targetTarball) {
-    throw new Error("--registry-package-tarball requires --target-tarball");
-  }
   return options;
+}
+
+function stripLeadingPackageManagerSeparator(argv: string[]): string[] {
+  return argv[0] === "--" ? argv.slice(1) : argv;
 }
 
 function platformRecord<T>(value: T): Record<Platform, T> {
@@ -496,14 +389,10 @@ function platformRecord<T>(value: T): Record<Platform, T> {
 }
 
 function formatDuration(durationMs: number): string {
-  if (!Number.isFinite(durationMs) || durationMs <= 0) {
-    return "0ms";
-  }
-  const roundedMs = Math.round(durationMs);
-  return formatDurationElapsed(
-    roundedMs < 1000 ? roundedMs : Math.round(durationMs / 1000) * 1000,
-    { showYears: false, unitCount: 2 },
-  );
+  const seconds = Math.round(durationMs / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes > 0 ? `${minutes}m ${remainder}s` : `${remainder}s`;
 }
 
 function readHarnessCheckoutVersion(): string {
@@ -517,29 +406,12 @@ function openClawVersionFamily(version: string): string {
   return /^(\d{4}\.\d{1,2}\.\d{1,2})(?:[-.]|$)/u.exec(version.trim())?.[1] ?? "";
 }
 
-export function parseRegistryPackageMetadata(raw: string): {
-  gitHead: string;
-  tarball: string;
-  version: string;
-} {
-  const value = raw.trim();
+function parseOpenClawPackageSpecVersion(spec: string): string {
+  const value = spec.trim();
   if (!value) {
-    return { gitHead: "", tarball: "", version: "" };
+    return "";
   }
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (!isRecord(parsed)) {
-      return { gitHead: "", tarball: "", version: "" };
-    }
-    const dist = isRecord(parsed.dist) ? parsed.dist : {};
-    return {
-      gitHead: readStringValue(parsed.gitHead) ?? "",
-      tarball: readStringValue(parsed["dist.tarball"]) || readStringValue(dist.tarball) || "",
-      version: readStringValue(parsed.version) ?? "",
-    };
-  } catch {
-    return { gitHead: "", tarball: "", version: "" };
-  }
+  return resolveOpenClawRegistryVersion(value) || "";
 }
 
 export class NpmUpdateSmoke {
@@ -549,6 +421,7 @@ export class NpmUpdateSmoke {
   private tgzDir = "";
   private latestVersion = "";
   private packageSpec = "";
+  private currentHead = "";
   private currentHeadShort = "";
   private harnessCheckoutVersion = "";
   private harnessTargetFamily = "";
@@ -562,29 +435,15 @@ export class NpmUpdateSmoke {
   private updateExpectedNeedle = "";
   private updateTargetPackageVersion = "";
   private updateTargetTarball = "";
-  private targetTarballPath = "";
-  private targetTarballBuildCommit = "";
-  private targetRegistryPackages: NpmRegistryPackage[] = [];
-  private targetTarballVersion = "";
-  private targetRegistryHostUrl = "";
-  private targetRegistryUrl = "";
-  private macosVm = macosVmDefault;
-  private windowsVm: string;
   private linuxVm = linuxVmDefault;
-  private options: NpmUpdateOptions;
-  private readonly updateTimeouts: UpdateTimeouts;
 
   private freshStatus = platformRecord("skip");
   private freshTargetStatus = platformRecord("skip");
   private updateStatus = platformRecord("skip");
   private updateVersion = platformRecord("skip");
-  private timings: JobTiming[] = [];
+  private timings: NpmUpdateSummary["timings"] = [];
 
-  constructor(options: NpmUpdateOptions) {
-    this.updateTimeouts = resolveUpdateTimeouts();
-    resolveFreshLaneTimeoutKillGraceMs();
-    this.options = options;
-    this.windowsVm = options.windowsVm ?? windowsVmDefault;
+  constructor(private options: NpmUpdateOptions) {
     this.auth = resolveProviderAuth({
       apiKeyEnv: options.apiKeyEnv,
       modelId: options.modelId,
@@ -616,27 +475,24 @@ export class NpmUpdateSmoke {
   protected async runSteps(): Promise<void> {
     this.latestVersion = resolveLatestVersion();
     this.packageSpec = this.options.packageSpec || `openclaw@${this.latestVersion}`;
-    this.currentHeadShort = run("git", ["rev-parse", "--short=7", "HEAD"]).stdout.trim();
+    this.currentHead = run("git", ["rev-parse", "HEAD"], { quiet: true }).stdout.trim();
+    this.currentHeadShort = run("git", ["rev-parse", "--short=7", "HEAD"], {
+      quiet: true,
+    }).stdout.trim();
     this.harnessCheckoutVersion = readHarnessCheckoutVersion();
     this.hostIp = resolveHostIp(this.options.hostIp ?? "");
-    await this.configureTargets();
+    this.configurePublishedTargets();
     this.assertPublishedTargetMatchesHarnessCheckout();
 
     if (this.options.platforms.has("linux")) {
       this.linuxVm = resolveUbuntuVmName(linuxVmDefault);
-    }
-    if (this.options.platforms.has("macos")) {
-      this.macosVm = resolveMacosVmName(
-        this.options.macosVm ?? macosVmDefault,
-        Boolean(this.options.macosVm),
-      );
     }
     this.preflightRegistryUpdateTarget();
 
     say(`Run fresh npm baseline: ${this.packageSpec}`);
     say(`Platforms: ${[...this.options.platforms].join(",")}`);
     say(`Run dir: ${this.runDir}`);
-    await this.runFreshInstalls("fresh");
+    await this.runFreshBaselines();
 
     await this.prepareUpdateTarget();
     say(`Run same-guest openclaw update to ${this.updateTargetEffective}`);
@@ -644,7 +500,7 @@ export class NpmUpdateSmoke {
 
     if (this.freshTargetSpec) {
       say(`Run fresh target npm install: ${this.freshTargetSpec}`);
-      await this.runFreshInstalls("fresh-target");
+      await this.runFreshTargetInstalls();
     }
 
     const summaryPath = await this.writeSummary();
@@ -656,81 +512,67 @@ export class NpmUpdateSmoke {
     }
   }
 
-  private async runFreshInstalls(phase: "fresh" | "fresh-target"): Promise<void> {
-    const packageSpec = phase === "fresh" ? this.packageSpec : this.freshTargetSpec;
+  private async runFreshBaselines(): Promise<void> {
     const jobs: Job[] = [];
-    for (const [platform, label, vm] of [
-      ["macos", "macOS", this.macosVm],
-      ["windows", "Windows", this.windowsVm],
-      ["linux", "Linux", this.linuxVm],
-    ] as const) {
-      if (!this.options.platforms.has(platform)) {
-        continue;
+    if (this.options.platforms.has("macos")) {
+      jobs.push(this.spawnFresh("macOS", "macos", []));
+    }
+    if (this.options.platforms.has("windows")) {
+      jobs.push(this.spawnFresh("Windows", "windows", []));
+    }
+    if (this.options.platforms.has("linux")) {
+      jobs.push(
+        this.spawnFresh("Linux", "linux", ["--vm", this.linuxVm], {
+          OPENCLAW_PARALLELS_LINUX_DISABLE_BONJOUR: "1",
+        }),
+      );
+    }
+    await this.monitorJobs("fresh", jobs);
+    for (const job of jobs) {
+      const status = (await job.promise) === 0 ? "pass" : "fail";
+      const platform = this.platformFromLabel(job.label);
+      this.freshStatus[platform] = status;
+      this.recordTiming("fresh", job, status);
+      if (status !== "pass") {
+        this.dumpLogTail(job.logPath);
+        die(`${job.label} fresh baseline failed; rerun: ${job.rerunCommand}`);
       }
+    }
+  }
+
+  private async runFreshTargetInstalls(): Promise<void> {
+    const jobs: Job[] = [];
+    if (this.options.platforms.has("macos")) {
+      jobs.push(this.spawnFresh("macOS", "macos", [], {}, this.freshTargetSpec, "fresh-target"));
+    }
+    if (this.options.platforms.has("windows")) {
+      jobs.push(
+        this.spawnFresh("Windows", "windows", [], {}, this.freshTargetSpec, "fresh-target"),
+      );
+    }
+    if (this.options.platforms.has("linux")) {
       jobs.push(
         this.spawnFresh(
-          label,
-          platform,
-          [
-            "--vm",
-            vm,
-            ...(platform === "macos" && this.options.macosSnapshotHint
-              ? ["--snapshot-hint", this.options.macosSnapshotHint]
-              : []),
-          ],
-          platform === "linux" ? { OPENCLAW_PARALLELS_LINUX_DISABLE_BONJOUR: "1" } : {},
-          packageSpec,
-          phase,
+          "Linux",
+          "linux",
+          ["--vm", this.linuxVm],
+          {
+            OPENCLAW_PARALLELS_LINUX_DISABLE_BONJOUR: "1",
+          },
+          this.freshTargetSpec,
+          "fresh-target",
         ),
       );
     }
-    await this.finishFreshJobs(
-      phase,
-      phase === "fresh" ? "fresh baseline" : "fresh target",
-      jobs,
-      phase === "fresh" ? this.freshStatus : this.freshTargetStatus,
-    );
-  }
-
-  private async finishFreshJobs(
-    phase: "fresh" | "fresh-target",
-    failureLabel: string,
-    jobs: Job[],
-    statuses: Record<Platform, string>,
-  ): Promise<void> {
-    await this.monitorJobs(phase, jobs);
-    const retries: Job[] = [];
+    await this.monitorJobs("fresh-target", jobs);
     for (const job of jobs) {
-      const platform = job.platform;
-      if ((await job.promise) === 0) {
-        statuses[platform] = "pass";
-        this.recordTiming(phase, job, "pass");
-        continue;
-      }
-      statuses[platform] = "retry";
-      this.recordTiming(phase, job, "retry");
-      this.dumpLogTail(job.logPath);
-      // Each fresh wrapper restores its baseline snapshot before running. Retry the
-      // whole lane so a failed install or guest session cannot leak partial state.
-      say(`${job.label} ${failureLabel} failed; retrying once from restored snapshot`);
-      const retry = job.retry?.();
-      if (!retry) {
-        die(`${job.label} ${failureLabel} failed; rerun: ${job.rerunCommand}`);
-      }
-      retries.push(retry);
-    }
-    if (retries.length === 0) {
-      return;
-    }
-    await this.monitorJobs(`${phase}-retry`, retries);
-    for (const job of retries) {
       const status = (await job.promise) === 0 ? "pass" : "fail";
-      const platform = job.platform;
-      statuses[platform] = status;
-      this.recordTiming(phase, job, status);
+      const platform = this.platformFromLabel(job.label);
+      this.freshTargetStatus[platform] = status;
+      this.recordTiming("fresh-target", job, status);
       if (status !== "pass") {
         this.dumpLogTail(job.logPath);
-        die(`${job.label} ${failureLabel} failed after retry; rerun: ${job.rerunCommand}`);
+        die(`${job.label} fresh target failed; rerun: ${job.rerunCommand}`);
       }
     }
   }
@@ -742,10 +584,8 @@ export class NpmUpdateSmoke {
     env: NodeJS.ProcessEnv = {},
     packageSpec = this.packageSpec,
     phase: "fresh" | "fresh-target" = "fresh",
-    attempt = 1,
   ): Job {
-    const retrySuffix = attempt === 1 ? "" : `-retry-${attempt}`;
-    const logPath = path.join(this.runDir, `${platform}-${phase}${retrySuffix}.log`);
+    const logPath = path.join(this.runDir, `${platform}-${phase}.log`);
     const auth = this.authForPlatform(platform);
     const script = `scripts/e2e/parallels-${platform}-smoke.sh`;
     const args = [
@@ -760,21 +600,9 @@ export class NpmUpdateSmoke {
       auth.apiKeyEnv,
       "--target-package-spec",
       packageSpec,
-      ...(phase === "fresh-target" && this.targetRegistryUrl
-        ? ["--npm-registry", this.targetRegistryUrl]
-        : []),
       "--json",
       ...extraArgs,
     ];
-    const commandEnv = {
-      ...env,
-      ...(phase === "fresh-target" && this.targetRegistryUrl
-        ? {
-            NPM_CONFIG_REGISTRY: this.targetRegistryHostUrl,
-            npm_config_registry: this.targetRegistryHostUrl,
-          }
-        : {}),
-    };
     const startedAt = Date.now();
     const job: Job = {
       done: false,
@@ -784,20 +612,15 @@ export class NpmUpdateSmoke {
       lastOutputAt: startedAt,
       lastPhase: "starting",
       logPath,
-      platform,
       promise: Promise.resolve(1),
-      retry:
-        attempt === 1
-          ? () => this.spawnFresh(label, platform, extraArgs, env, packageSpec, phase, attempt + 1)
-          : undefined,
-      rerunCommand: this.formatRerun("bash", args, commandEnv),
+      rerunCommand: this.formatRerun("bash", args, env),
       startedAt,
     };
-    job.promise = spawnLoggedCommand(
+    job.promise = this.spawnLogged(
       "bash",
       args,
       logPath,
-      commandEnv,
+      env,
       (text) => this.noteJobOutput(job, text),
       {
         timeoutLabel: `${label} ${phase}`,
@@ -811,62 +634,35 @@ export class NpmUpdateSmoke {
   }
 
   private async prepareUpdateTarget(): Promise<void> {
-    if (this.targetTarballPath) {
-      const hostedTarballPath = path.join(this.tgzDir, path.basename(this.targetTarballPath));
-      await copyFile(this.targetTarballPath, hostedTarballPath);
-      this.artifact = {
-        buildCommit: this.targetTarballBuildCommit,
-        buildCommitShort: this.targetTarballBuildCommit.slice(0, 7),
-        path: hostedTarballPath,
-        version: this.targetTarballVersion,
-        registryPackages: this.targetRegistryPackages,
-      };
-    } else if (!this.options.updateTarget || this.options.updateTarget === "local-main") {
-      const providerConfig = resolveProviderConfig(this.options.provider);
-      if (!providerConfig) {
-        die(`missing release smoke configuration for provider: ${this.options.provider}`);
-      }
+    if (!this.options.updateTarget || this.options.updateTarget === "local-main") {
       this.artifact = await packOpenClaw({
         destination: this.tgzDir,
         requireControlUi: true,
-        requiredCompanionPackages: providerConfig.requiredCompanionPackages,
       });
-    } else {
-      this.updateTargetEffective = this.options.updateTarget;
-      this.updateExpectedNeedle = this.isExplicitPackageTarget(this.updateTargetEffective)
-        ? ""
-        : resolveOpenClawRegistryVersion(this.updateTargetEffective) || this.updateTargetEffective;
-      const metadata = this.resolveRegistryPackageMetadata(this.updateTargetEffective);
-      this.updateTargetPackageVersion = metadata.version;
+      this.server = await startHostServer({
+        artifactPath: this.artifact.path,
+        dir: this.tgzDir,
+        hostIp: this.hostIp,
+        label: "current main tgz",
+        port: 0,
+      });
+      this.updateTargetEffective = this.server.urlFor(this.artifact.path);
+      this.updateExpectedNeedle = this.currentHeadShort;
+      this.updateTargetPackageVersion = this.artifact.version ?? "";
       this.updateTargetBuildCommit =
-        metadata.gitHead || this.resolvePackageBuildCommit(metadata.tarball);
-      this.updateTargetTarball = metadata.tarball;
+        this.artifact.buildCommitShort ?? this.artifact.buildCommit ?? "";
+      this.updateTargetTarball = this.updateTargetEffective;
       return;
     }
-    this.server = await startSmokeArtifactServer({
-      artifact: this.artifact,
-      dir: this.tgzDir,
-      hostIp: this.hostIp,
-      label: this.targetTarballPath ? "prepared candidate tgz" : "current main tgz",
-      port: 0,
-    });
-    this.targetRegistryHostUrl = this.server.registry?.hostUrl ?? "";
-    this.targetRegistryUrl = this.server.registry?.url ?? "";
-    this.updateTargetPackageVersion = await expectedPackageTargetVersion(this.artifact);
-    this.updateTargetTarball = this.server.urlFor(this.artifact.path);
-    this.updateTargetEffective = this.targetRegistryUrl
-      ? this.updateTargetPackageVersion
-      : this.updateTargetTarball;
-    if (this.targetTarballPath) {
-      this.freshTargetSpec = this.targetRegistryUrl
-        ? `openclaw@${this.updateTargetPackageVersion}`
-        : this.updateTargetTarball;
-    }
-    this.updateExpectedNeedle = this.targetTarballPath
-      ? this.targetTarballVersion
-      : this.currentHeadShort;
+    this.updateTargetEffective = this.options.updateTarget;
+    this.updateExpectedNeedle = this.isExplicitPackageTarget(this.updateTargetEffective)
+      ? ""
+      : resolveOpenClawRegistryVersion(this.updateTargetEffective) || this.updateTargetEffective;
+    const metadata = this.resolveRegistryPackageMetadata(this.updateTargetEffective);
+    this.updateTargetPackageVersion = metadata.version;
     this.updateTargetBuildCommit =
-      this.artifact.buildCommitShort ?? this.artifact.buildCommit ?? "";
+      metadata.gitHead || this.resolvePackageBuildCommit(metadata.tarball);
+    this.updateTargetTarball = metadata.tarball;
   }
 
   private resolvePackageBuildCommit(tarball: string): string {
@@ -875,15 +671,10 @@ export class NpmUpdateSmoke {
     }
     const output = run(
       "bash",
-      [
-        "-lc",
-        `curl -fsSL --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 ${shellQuote(
-          tarball,
-        )} | tar -xzOf - package/dist/build-info.json`,
-      ],
+      ["-lc", `curl -fsSL ${shellQuote(tarball)} | tar -xzOf - package/dist/build-info.json`],
       {
         check: false,
-        timeoutMs: 150_000,
+        quiet: true,
       },
     ).stdout.trim();
     if (!output) {
@@ -908,33 +699,47 @@ export class NpmUpdateSmoke {
     const spec = target.startsWith("openclaw@") ? target : `openclaw@${target}`;
     const output = run("npm", ["view", spec, "version", "dist.tarball", "gitHead", "--json"], {
       check: false,
-    }).stdout;
-    return parseRegistryPackageMetadata(output);
+      quiet: true,
+    }).stdout.trim();
+    if (!output) {
+      return { gitHead: "", tarball: "", version: "" };
+    }
+    try {
+      const parsed = JSON.parse(output) as {
+        dist?: { tarball?: string };
+        gitHead?: string;
+        version?: string;
+      };
+      return {
+        gitHead: parsed.gitHead ?? "",
+        tarball: parsed.dist?.tarball ?? "",
+        version: parsed.version ?? "",
+      };
+    } catch {
+      return { gitHead: "", tarball: "", version: "" };
+    }
   }
 
   private async runSameGuestUpdates(): Promise<void> {
     const jobs: Job[] = [];
-    for (const [platform, label, vm, runGuest] of [
-      ["macos", "macOS", this.macosVm, this.guestMacos.bind(this)],
-      ["windows", "Windows", this.windowsVm, this.guestWindows.bind(this)],
-      ["linux", "Linux", this.linuxVm, this.guestLinux.bind(this)],
-    ] as const) {
-      if (!this.options.platforms.has(platform)) {
-        continue;
-      }
-      ensureVmRunning(vm);
-      jobs.push(
-        this.spawnUpdate(label, platform, (ctx) =>
-          runGuest(this.updateScript(platform), this.updateTimeouts.timeoutMs, ctx),
-        ),
-      );
+    if (this.options.platforms.has("macos")) {
+      ensureVmRunning(macosVm);
+      jobs.push(this.spawnUpdate("macOS", "macos", (ctx) => this.runMacosUpdate(ctx)));
+    }
+    if (this.options.platforms.has("windows")) {
+      ensureVmRunning(windowsVm);
+      jobs.push(this.spawnUpdate("Windows", "windows", (ctx) => this.runWindowsUpdate(ctx)));
+    }
+    if (this.options.platforms.has("linux")) {
+      ensureVmRunning(this.linuxVm);
+      jobs.push(this.spawnUpdate("Linux", "linux", (ctx) => this.runLinuxUpdate(ctx)));
     }
     await this.monitorJobs("update", jobs);
     for (const job of jobs) {
-      const platform = job.platform;
+      const platform = this.platformFromLabel(job.label);
       const status = (await job.promise) === 0 ? "pass" : "fail";
       this.updateStatus[platform] = status;
-      this.updateVersion[platform] = await extractLastOpenClawVersionFromLog(job.logPath);
+      this.updateVersion[platform] = await this.extractLastVersion(job.logPath);
       this.recordTiming("update", job, status);
       if (status !== "pass") {
         this.dumpLogTail(job.logPath);
@@ -958,7 +763,6 @@ export class NpmUpdateSmoke {
       lastOutputAt: startedAt,
       lastPhase: "starting",
       logPath,
-      platform,
       promise: Promise.resolve(1),
       rerunCommand: `inspect ${logPath}; rerun aggregate phase with --platform ${platform}`,
       startedAt,
@@ -973,9 +777,10 @@ export class NpmUpdateSmoke {
       return await runTimedUpdateJob({
         append,
         label,
-        run: ({ signal }) => fn({ append, signal }),
-        timeoutDescription: `${this.updateTimeouts.seconds}s plus cleanup backstop`,
-        timeoutMs: this.updateTimeouts.withCleanupMs,
+        run: ({ signal }) => fn({ append, logPath, signal }),
+        timeoutDescription: `${updateTimeoutSeconds}s plus cleanup backstop`,
+        timeoutMs: updateTimeoutSeconds * 1000 + updateCleanupBackstopMs,
+        writeLog: async () => undefined,
       });
     })().finally(() => {
       job.durationMs = Date.now() - job.startedAt;
@@ -984,33 +789,67 @@ export class NpmUpdateSmoke {
     return job;
   }
 
+  private async runMacosUpdate(ctx: UpdateJobContext): Promise<void> {
+    await this.guestMacos(this.updateScript("macos"), updateTimeoutSeconds * 1000, ctx);
+  }
+
+  private runWindowsUpdate(ctx: UpdateJobContext): Promise<void> {
+    return this.guestWindows(this.updateScript("windows"), updateTimeoutSeconds * 1000, ctx);
+  }
+
+  private async runLinuxUpdate(ctx: UpdateJobContext): Promise<void> {
+    await this.guestLinux(this.updateScript("linux"), updateTimeoutSeconds * 1000, ctx);
+  }
+
   private updateScript(platform: Platform): string {
-    const buildScript = {
-      macos: macosUpdateScript,
-      windows: windowsUpdateScript,
-      linux: linuxUpdateScript,
-    }[platform];
-    return buildScript({
+    const input = {
       auth: this.authForPlatform(platform),
       expectedNeedle: this.updateExpectedNeedle,
-      npmRegistry: this.targetRegistryUrl,
       updateTarget: this.updateTargetEffective,
-    });
+    };
+    switch (platform) {
+      case "macos":
+        return macosUpdateScript(input);
+      case "windows":
+        return windowsUpdateScript(input);
+      case "linux":
+        return linuxUpdateScript(input);
+    }
+    return die("unsupported platform");
   }
 
   private authForPlatform(platform: Platform): ProviderAuth {
     return platform === "windows" ? this.windowsAuth : this.auth;
   }
 
+  private spawnLogged(
+    command: string,
+    args: string[],
+    logPath: string,
+    env: NodeJS.ProcessEnv = {},
+    onOutput: (text: string) => void = () => undefined,
+    options: SpawnLoggedOptions = {},
+  ): Promise<number> {
+    return spawnLoggedCommand(command, args, logPath, env, onOutput, options);
+  }
+
   private async monitorJobs(label: string, jobs: Job[]): Promise<void> {
-    let pending = jobs;
-    while (pending.length > 0) {
+    const pending = new Set(jobs.map((job) => job.label));
+    while (pending.size > 0) {
       await new Promise((resolve) => {
         setTimeout(resolve, 15_000);
       });
-      pending = pending.filter((job) => !job.done);
-      if (pending.length > 0) {
-        const status = pending
+      for (const job of jobs) {
+        if (!pending.has(job.label)) {
+          continue;
+        }
+        if (job.done) {
+          pending.delete(job.label);
+        }
+      }
+      if (pending.size > 0) {
+        const status = jobs
+          .filter((job) => pending.has(job.label))
           .map((job) => {
             const elapsed = Math.floor((Date.now() - job.startedAt) / 1000);
             const stale = Math.floor((Date.now() - job.lastOutputAt) / 1000);
@@ -1027,32 +866,26 @@ export class NpmUpdateSmoke {
     timeoutMs: number,
     ctx: UpdateJobContext,
   ): Promise<void> {
-    const macosUpdateExec = this.resolveMacosUpdateExec(ctx);
     const scriptPath = this.writeGuestScript(
-      this.macosVm,
+      macosVm,
       script,
       "openclaw-parallels-npm-update-macos",
-      { execArgs: macosUpdateExec.execArgs, mode: "700", runCommand: runMacosHostCommand },
     );
-    const cleanup = () => this.removeGuestScript(this.macosVm, scriptPath, runMacosHostCommand);
-    // Checked host commands can exit the process; finally only handles thrown failures.
-    process.once("exit", cleanup);
+    const macosExecArgs = this.resolveMacosUpdateExecArgs(ctx);
+    const sudoUserArgIndex = macosExecArgs.indexOf("-u");
+    const sudoUser =
+      sudoUserArgIndex >= 0 && sudoUserArgIndex + 1 < macosExecArgs.length
+        ? macosExecArgs[sudoUserArgIndex + 1]
+        : "";
+    if (sudoUser) {
+      run("prlctl", ["exec", macosVm, "/usr/sbin/chown", sudoUser, scriptPath], {
+        timeoutMs: 30_000,
+      });
+    }
     try {
-      runMacosHostCommand(
-        "prlctl",
-        ["exec", this.macosVm, "/usr/sbin/chown", macosUpdateExec.ownerUser, scriptPath],
-        {
-          timeoutMs: 30_000,
-        },
-      );
-      const invocation = resolveMacosPrlctlInvocation(
-        "prlctl",
-        ["exec", this.macosVm, ...macosUpdateExec.execArgs, "/bin/bash", scriptPath],
-        timeoutMs,
-      );
       const status = await this.runStreamingToJobLog(
-        invocation.command,
-        invocation.args,
+        "prlctl",
+        ["exec", macosVm, ...macosExecArgs, "/bin/bash", scriptPath],
         timeoutMs,
         ctx,
       );
@@ -1060,28 +893,21 @@ export class NpmUpdateSmoke {
         throw new Error(`macOS update command failed with exit code ${status}`);
       }
     } finally {
-      process.off("exit", cleanup);
-      cleanup();
+      this.removeGuestScript(macosVm, scriptPath);
     }
   }
 
-  private resolveMacosUpdateExec(ctx: UpdateJobContext): MacosUpdateExec {
+  private resolveMacosUpdateExecArgs(ctx: UpdateJobContext): string[] {
     const guestPath =
       "/opt/homebrew/bin:/opt/homebrew/opt/node/bin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
-    const currentUser = runMacosHostCommand(
-      "prlctl",
-      ["exec", this.macosVm, "--current-user", "whoami"],
-      {
-        check: false,
-        timeoutMs: 45_000,
-      },
-    );
+    const currentUser = run("prlctl", ["exec", macosVm, "--current-user", "whoami"], {
+      check: false,
+      quiet: true,
+      timeoutMs: 45_000,
+    });
     const user = currentUser.stdout.trim().replaceAll("\r", "").split("\n").at(-1) ?? "";
     if (currentUser.status === 0 && /^[A-Za-z0-9._-]+$/.test(user)) {
-      return {
-        execArgs: ["--current-user", "/usr/bin/env", `PATH=${guestPath}`],
-        ownerUser: user,
-      };
+      return ["--current-user", "/usr/bin/env", `PATH=${guestPath}`];
     }
 
     const fallbackUser = this.resolveMacosDesktopUser();
@@ -1094,35 +920,65 @@ export class NpmUpdateSmoke {
       `desktop user unavailable via Parallels --current-user; using root sudo fallback for ${fallbackUser}\n`,
     );
     const home = this.resolveMacosDesktopHome(fallbackUser);
-    return {
-      execArgs: [
-        "/usr/bin/sudo",
-        "-H",
-        "-u",
-        fallbackUser,
-        "/usr/bin/env",
-        `HOME=${home}`,
-        `USER=${fallbackUser}`,
-        `LOGNAME=${fallbackUser}`,
-        `PATH=${guestPath}`,
-      ],
-      ownerUser: fallbackUser,
-    };
+    return [
+      "/usr/bin/sudo",
+      "-H",
+      "-u",
+      fallbackUser,
+      "/usr/bin/env",
+      `HOME=${home}`,
+      `USER=${fallbackUser}`,
+      `LOGNAME=${fallbackUser}`,
+      `PATH=${guestPath}`,
+    ];
   }
 
   private resolveMacosDesktopUser(): string {
-    return resolveMacosDesktopUser((args) => this.readMacosDesktopUserOutput(args));
+    const consoleUser =
+      run("prlctl", ["exec", macosVm, "/usr/bin/stat", "-f", "%Su", "/dev/console"], {
+        check: false,
+        quiet: true,
+        timeoutMs: 30_000,
+      })
+        .stdout.trim()
+        .replaceAll("\r", "")
+        .split("\n")
+        .at(-1) ?? "";
+    if (
+      /^[A-Za-z0-9._-]+$/.test(consoleUser) &&
+      consoleUser !== "root" &&
+      consoleUser !== "loginwindow"
+    ) {
+      return consoleUser;
+    }
+    const users = run(
+      "prlctl",
+      ["exec", macosVm, "/usr/bin/dscl", ".", "-list", "/Users", "NFSHomeDirectory"],
+      { check: false, quiet: true, timeoutMs: 30_000 },
+    ).stdout.replaceAll("\r", "");
+    for (const line of users.split("\n")) {
+      const [user, home] = line.trim().split(/\s+/);
+      if (
+        user &&
+        home?.startsWith("/Users/") &&
+        !user.startsWith("_") &&
+        user !== "Shared" &&
+        user !== ".localized"
+      ) {
+        return user;
+      }
+    }
+    return "";
   }
 
   private resolveMacosDesktopHome(user: string): string {
-    return resolveMacosDesktopHome(user, (args) => this.readMacosDesktopUserOutput(args));
-  }
-
-  private readMacosDesktopUserOutput(args: string[]): string {
-    return runMacosHostCommand("prlctl", ["exec", this.macosVm, ...args], {
-      check: false,
-      timeoutMs: 30_000,
-    }).stdout;
+    const output = run(
+      "prlctl",
+      ["exec", macosVm, "/usr/bin/dscl", ".", "-read", `/Users/${user}`, "NFSHomeDirectory"],
+      { check: false, quiet: true, timeoutMs: 30_000 },
+    ).stdout.replaceAll("\r", "");
+    const match = /NFSHomeDirectory:\s*(\S+)/.exec(output);
+    return match?.[1] ?? `/Users/${user}`;
   }
 
   private async guestWindows(
@@ -1132,11 +988,10 @@ export class NpmUpdateSmoke {
   ): Promise<void> {
     await runWindowsBackgroundPowerShell({
       append: (chunk) => ctx.append(chunk),
-      beforeLaunchAttempt: () => ensureVmRunning(this.windowsVm),
       label: "Windows update",
       script,
       timeoutMs,
-      vmName: this.windowsVm,
+      vmName: windowsVm,
     });
   }
 
@@ -1174,52 +1029,34 @@ export class NpmUpdateSmoke {
     }
   }
 
-  private writeGuestScript(
-    vm: string,
-    script: string,
-    prefix: string,
-    options: { execArgs?: string[]; mode?: "700" | "755"; runCommand?: typeof run } = {},
-  ): string {
-    const runCommand = options.runCommand ?? run;
-    const execArgs = options.execArgs ?? [];
-    const mode = options.mode ?? "755";
-    const scriptPath = `/tmp/${prefix}-${randomUUID()}.sh`;
-    try {
-      const write = runCommand("prlctl", ["exec", vm, ...execArgs, "/usr/bin/tee", scriptPath], {
-        check: false,
-        input: script,
-        timeoutMs: 120_000,
-      });
-      if (write.status !== 0) {
-        throw new Error(`failed to write guest script ${scriptPath}: ${write.stderr.trim()}`);
-      }
-      const chmod = runCommand(
-        "prlctl",
-        ["exec", vm, ...execArgs, "/bin/chmod", mode, scriptPath],
-        {
-          check: false,
-          timeoutMs: 30_000,
-        },
-      );
-      if (chmod.status !== 0) {
-        throw new Error(`failed to chmod guest script ${scriptPath}: ${chmod.stderr.trim()}`);
-      }
-    } catch (error) {
-      this.removeGuestScript(vm, scriptPath, runCommand);
-      throw error;
+  private writeGuestScript(vm: string, script: string, prefix: string): string {
+    const scriptPath = `/tmp/${prefix}-${process.pid}-${Date.now()}.sh`;
+    const write = run("prlctl", ["exec", vm, "/usr/bin/tee", scriptPath], {
+      check: false,
+      input: script,
+      quiet: true,
+      timeoutMs: 120_000,
+    });
+    if (write.status !== 0) {
+      throw new Error(`failed to write guest script ${scriptPath}: ${write.stderr.trim()}`);
+    }
+    const chmod = run("prlctl", ["exec", vm, "/bin/chmod", "755", scriptPath], {
+      check: false,
+      quiet: true,
+      timeoutMs: 30_000,
+    });
+    if (chmod.status !== 0) {
+      throw new Error(`failed to chmod guest script ${scriptPath}: ${chmod.stderr.trim()}`);
     }
     return scriptPath;
   }
 
-  private removeGuestScript(vm: string, scriptPath: string, runCommand: typeof run = run): void {
-    try {
-      runCommand("prlctl", ["exec", vm, "/bin/rm", "-f", scriptPath], {
-        check: false,
-        timeoutMs: 30_000,
-      });
-    } catch {
-      // Cleanup must not hide the update failure that made the log useful.
-    }
+  private removeGuestScript(vm: string, scriptPath: string): void {
+    run("prlctl", ["exec", vm, "/bin/rm", "-f", scriptPath], {
+      check: false,
+      quiet: true,
+      timeoutMs: 30_000,
+    });
   }
 
   private async runStreamingToJobLog(
@@ -1241,8 +1078,6 @@ export class NpmUpdateSmoke {
 
       let timedOut = false;
       let killTimer: NodeJS.Timeout | undefined;
-      let forceKillAt: number | undefined;
-      const timeoutKillGraceMs = resolveFreshLaneTimeoutKillGraceMs();
       const signalChild = (signal: NodeJS.Signals): void => {
         if (!child.pid) {
           return;
@@ -1263,8 +1098,7 @@ export class NpmUpdateSmoke {
         }
         timedOut = true;
         signalChild("SIGTERM");
-        forceKillAt = Date.now() + timeoutKillGraceMs;
-        killTimer = setTimeout(() => signalChild("SIGKILL"), timeoutKillGraceMs);
+        killTimer = setTimeout(() => signalChild("SIGKILL"), 2_000);
         killTimer.unref();
       };
       if (ctx.signal.aborted) {
@@ -1278,7 +1112,6 @@ export class NpmUpdateSmoke {
 
       child.on("error", (error) => {
         ctx.signal.removeEventListener("abort", abort);
-        clearTimeout(timer);
         if (killTimer) {
           clearTimeout(killTimer);
         }
@@ -1291,10 +1124,8 @@ export class NpmUpdateSmoke {
           clearTimeout(killTimer);
         }
         if (timedOut) {
-          void finishTimedOutLoggedProcessTree(child, {
-            forceKillAt,
-            timeoutKillGraceMs,
-          }).then(() => resolve(124), reject);
+          signalChild("SIGKILL");
+          resolve(124);
           return;
         }
         resolve(code ?? (signal ? 128 : 1));
@@ -1327,8 +1158,19 @@ export class NpmUpdateSmoke {
     }
   }
 
+  private platformFromLabel(label: string): Platform {
+    if (label === "macOS") {
+      return "macos";
+    }
+    return label.toLowerCase() as Platform;
+  }
+
+  private async extractLastVersion(logPath: string): Promise<string> {
+    return await extractLastOpenClawVersionFromLog(logPath);
+  }
+
   private dumpLogTail(logPath: string): void {
-    const log = run("tail", ["-n", "80", logPath], { check: false }).stdout;
+    const log = run("tail", ["-n", "80", logPath], { check: false, quiet: true }).stdout;
     if (log) {
       process.stderr.write(`\n--- tail ${logPath} ---\n`);
       process.stderr.write(log);
@@ -1345,69 +1187,7 @@ export class NpmUpdateSmoke {
     });
   }
 
-  private async configureTargets(): Promise<void> {
-    if (this.options.targetTarball) {
-      const targetTarballPath = path.resolve(this.options.targetTarball);
-      if (!existsSync(targetTarballPath)) {
-        throw new Error(`target tarball does not exist: ${targetTarballPath}`);
-      }
-      this.targetTarballPath = targetTarballPath;
-      const [targetPackageJson, targetBuildCommit] = await Promise.all([
-        extractPackageJsonFromTgz<{
-          dependencies?: Record<string, string>;
-          version?: string;
-        }>(targetTarballPath, "package/package.json"),
-        packageBuildCommitFromTgz(targetTarballPath),
-      ]);
-      this.targetTarballVersion = targetPackageJson.version ?? "";
-      this.targetTarballBuildCommit = targetBuildCommit;
-      const readTarballs = (tarballs: string[], kind: "dependency" | "registry package") =>
-        Promise.all(
-          tarballs.map(async (tarball) => {
-            const tarballPath = path.resolve(tarball);
-            if (!existsSync(tarballPath)) {
-              throw new Error(`${kind} tarball does not exist: ${tarballPath}`);
-            }
-            const pkg = await extractPackageJsonFromTgz<{
-              name?: string;
-              version?: string;
-            }>(tarballPath, "package/package.json");
-            const name = pkg.name ?? "";
-            const version = pkg.version ?? "";
-            if (!name || !version || name === "openclaw") {
-              throw new Error(
-                `${kind} tarball has invalid ${kind === "dependency" ? "package " : ""}metadata: ${tarballPath}`,
-              );
-            }
-            if (kind === "dependency") {
-              if (targetPackageJson.dependencies?.[name] !== version) {
-                throw new Error(
-                  `target tarball requires ${name}@${targetPackageJson.dependencies?.[name] ?? "<missing>"}, but companion tarball provides ${version}`,
-                );
-              }
-            } else if (version !== this.targetTarballVersion) {
-              throw new Error(
-                `registry package ${name}@${version} does not match candidate ${this.targetTarballVersion}`,
-              );
-            }
-            return { name, version, tarballPath };
-          }),
-        );
-      this.targetRegistryPackages = [
-        ...(await readTarballs(this.options.dependencyTarballs, "dependency")),
-        ...(await readTarballs(this.options.registryPackageTarballs, "registry package")),
-      ];
-      const registryPackageNames = new Set(this.targetRegistryPackages.map((pkg) => pkg.name));
-      if (registryPackageNames.size !== this.targetRegistryPackages.length) {
-        throw new Error("candidate registry tarballs must have unique package names");
-      }
-      if (!this.targetTarballVersion || !this.targetTarballBuildCommit) {
-        throw new Error(
-          `target tarball is missing package or build metadata: ${targetTarballPath}`,
-        );
-      }
-      return;
-    }
+  private configurePublishedTargets(): void {
     if (this.options.betaValidation) {
       const version = resolveOpenClawRegistryVersion(this.options.betaValidation);
       if (!version) {
@@ -1437,9 +1217,9 @@ export class NpmUpdateSmoke {
     if (process.env.OPENCLAW_PARALLELS_ALLOW_HARNESS_TARGET_MISMATCH === "1") {
       return;
     }
-    const candidateVersion =
-      this.targetTarballVersion ||
-      resolveOpenClawRegistryVersion(this.freshTargetSpec || this.options.updateTarget);
+    const candidateVersion = this.freshTargetSpec
+      ? parseOpenClawPackageSpecVersion(this.freshTargetSpec)
+      : parseOpenClawPackageSpecVersion(this.options.updateTarget);
     const targetFamily = openClawVersionFamily(candidateVersion);
     if (!targetFamily) {
       return;
@@ -1473,7 +1253,7 @@ export class NpmUpdateSmoke {
 
   private async writeSummary(): Promise<string> {
     const slowestTiming = this.timings.toSorted((a, b) => b.durationMs - a.durationMs)[0];
-    const summary = {
+    const summary: NpmUpdateSummary = {
       currentHead: this.currentHeadShort,
       fresh: this.freshStatus,
       freshTarget: this.freshTargetStatus,
@@ -1528,17 +1308,10 @@ export class NpmUpdateSmoke {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  const argv = process.argv.slice(2);
-  if ((argv[0] === "--" ? argv[1] : argv[0]) === "--prerequisite-check") {
-    process.exitCode = runParallelsPrerequisiteEval(argv, process.env, {
-      write: (value) => process.stdout.write(value),
-    });
-  } else {
-    const options = parseArgs(argv);
-    const runSmoke = () => new NpmUpdateSmoke(options).run();
-    const runPromise = options.json ? withProgressOnStderr(runSmoke) : runSmoke();
-    await runPromise.catch((error: unknown) => {
-      die(error instanceof Error ? error.message : String(error));
-    });
-  }
+  const options = parseArgs(process.argv.slice(2));
+  const runSmoke = () => new NpmUpdateSmoke(options).run();
+  const runPromise = options.json ? withProgressOnStderr(runSmoke) : runSmoke();
+  await runPromise.catch((error: unknown) => {
+    die(error instanceof Error ? error.message : String(error));
+  });
 }

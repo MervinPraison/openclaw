@@ -44,6 +44,17 @@ run_logged_sweep_command() {
   fi
 }
 
+lifecycle_trace_enabled() {
+  case "${OPENCLAW_PLUGIN_LIFECYCLE_TRACE:-}" in
+    1 | true | TRUE | yes | YES)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 plugin_entries=()
 while IFS= read -r plugin_entry; do
   plugin_entries+=("$plugin_entry")
@@ -64,7 +75,7 @@ for plugin_entry in "${plugin_entries[@]}"; do
   echo "Installing bundled plugin: $plugin_id ($plugin_dir)"
   run_logged_sweep_command "install $plugin_id" "$install_log" \
     node "$OPENCLAW_ENTRY" plugins install "$plugin_id"
-  if docker_e2e_lifecycle_trace_enabled; then
+  if lifecycle_trace_enabled; then
     docker_e2e_print_log "$install_log"
   fi
   install_finished_at="$(now_ms)"
@@ -83,7 +94,7 @@ for plugin_entry in "${plugin_entries[@]}"; do
   echo "Uninstalling bundled plugin: $plugin_id ($plugin_dir)"
   run_logged_sweep_command "uninstall $plugin_id" "$uninstall_log" \
     node "$OPENCLAW_ENTRY" plugins uninstall "$plugin_id" --force
-  if docker_e2e_lifecycle_trace_enabled; then
+  if lifecycle_trace_enabled; then
     docker_e2e_print_log "$uninstall_log"
   fi
   uninstall_finished_at="$(now_ms)"

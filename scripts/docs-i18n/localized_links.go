@@ -13,6 +13,7 @@ import (
 type routeIndex struct {
 	targetLang      string
 	redirects       map[string]string
+	sourceRoutes    map[string]struct{}
 	localizedRoutes map[string]struct{}
 	localePrefixes  map[string]struct{}
 }
@@ -29,7 +30,7 @@ type docsRedirect struct {
 var (
 	localeDirRe             = regexp.MustCompile(`^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$`)
 	fencedBacktickCodeBlock = regexp.MustCompile("(?ms)(^|\\n)[ \\t]*```[^\\n]*\\n.*?\\n[ \\t]*```[ \\t]*(?:\\n|$)")
-	fencedTildeCodeBlock    = regexp.MustCompile(`(?ms)(^|\n)[ \t]*~~~[^\n]*\n.*?\n[ \t]*~~~[ \t]*(?:\n|$)`)
+	fencedTildeCodeBlock    = regexp.MustCompile("(?ms)(^|\\n)[ \\t]*~~~[^\\n]*\\n.*?\\n[ \\t]*~~~[ \\t]*(?:\\n|$)")
 	markdownLinkTargetRe    = regexp.MustCompile(`!?\[[^\]]*\]\(([^)]+)\)`)
 	hrefDoubleQuotedValueRe = regexp.MustCompile(`\bhref\s*=\s*"([^"]*)"`)
 	hrefSingleQuotedValueRe = regexp.MustCompile(`\bhref\s*=\s*'([^']*)'`)
@@ -39,6 +40,7 @@ func loadRouteIndex(docsRoot, targetLang string) (*routeIndex, error) {
 	index := &routeIndex{
 		targetLang:      strings.TrimSpace(targetLang),
 		redirects:       map[string]string{},
+		sourceRoutes:    map[string]struct{}{},
 		localizedRoutes: map[string]struct{}{},
 		localePrefixes:  map[string]struct{}{},
 	}
@@ -105,9 +107,16 @@ func (ri *routeIndex) loadRoutes(docsRoot string) error {
 		if err != nil {
 			return err
 		}
-		if firstSegment == ri.targetLang {
+		permalinks := extractPermalinks(content)
+
+		switch {
+		case firstSegment == ri.targetLang:
 			trimmedRel := strings.TrimPrefix(relPath, firstSegment+"/")
-			addRouteCandidates(ri.localizedRoutes, trimmedRel, extractPermalinks(content))
+			addRouteCandidates(ri.localizedRoutes, trimmedRel, permalinks)
+		case ri.isLocalePrefix(firstSegment):
+			return nil
+		default:
+			addRouteCandidates(ri.sourceRoutes, relPath, permalinks)
 		}
 		return nil
 	})
@@ -144,8 +153,11 @@ func normalizeSlashes(path string) string {
 }
 
 func firstPathSegment(relPath string) string {
-	segment, _, _ := strings.Cut(relPath, "/")
-	return segment
+	if relPath == "" {
+		return ""
+	}
+	parts := strings.SplitN(relPath, "/", 2)
+	return parts[0]
 }
 
 func addRouteCandidates(routes map[string]struct{}, relPath string, permalinks []string) {
@@ -212,26 +224,70 @@ func (ri *routeIndex) localizeBodyLinks(body string) string {
 	}
 
 	state := NewPlaceholderState(body)
-	masked := maskMatches(body, fencedBacktickCodeBlock, state)
-	masked = maskMatches(masked, fencedTildeCodeBlock, state)
-	masked = maskMatches(masked, inlineCodeRe, state)
+	placeholders := make([]string, 0, 8)
+	mapping := map[string]string{}
+	masked := maskMatches(body, fencedBacktickCodeBlock, state.Next, &placeholders, mapping)
+	masked = maskMatches(masked, fencedTildeCodeBlock, state.Next, &placeholders, mapping)
+	masked = maskMatches(masked, inlineCodeRe, state.Next, &placeholders, mapping)
 
-	masked = rewriteCapturedTargets(masked, markdownLinkTargetRe, ri, true)
-	masked = rewriteCapturedTargets(masked, hrefDoubleQuotedValueRe, ri, false)
-	masked = rewriteCapturedTargets(masked, hrefSingleQuotedValueRe, ri, false)
+	masked = rewriteMarkdownLinkTargets(masked, ri)
+	masked = rewriteHrefTargets(masked, ri)
 
-	return unmaskMarkdown(masked, state.placeholders, state.mapping)
+	return unmaskMarkdown(masked, placeholders, mapping)
 }
 
-func rewriteCapturedTargets(text string, re *regexp.Regexp, ri *routeIndex, skipImages bool) string {
-	return re.ReplaceAllStringFunc(text, func(match string) string {
-		if skipImages && strings.HasPrefix(match, "!") {
-			return match
+func rewriteMarkdownLinkTargets(text string, ri *routeIndex) string {
+	matches := markdownLinkTargetRe.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return text
+	}
+
+	var out strings.Builder
+	pos := 0
+	for _, span := range matches {
+		fullStart, targetStart, targetEnd := span[0], span[2], span[3]
+		if fullStart < pos {
+			continue
 		}
-		span := re.FindStringSubmatchIndex(match)
-		start, end := span[2], span[3]
-		return match[:start] + ri.localizeURL(match[start:end]) + match[end:]
-	})
+
+		out.WriteString(text[pos:targetStart])
+		target := text[targetStart:targetEnd]
+		if text[fullStart] == '!' {
+			out.WriteString(target)
+		} else {
+			out.WriteString(ri.localizeURL(target))
+		}
+		pos = targetEnd
+	}
+	out.WriteString(text[pos:])
+	return out.String()
+}
+
+func rewriteHrefTargets(text string, ri *routeIndex) string {
+	text = rewriteCapturedTargets(text, hrefDoubleQuotedValueRe, 2, ri)
+	text = rewriteCapturedTargets(text, hrefSingleQuotedValueRe, 2, ri)
+	return text
+}
+
+func rewriteCapturedTargets(text string, re *regexp.Regexp, groupIndex int, ri *routeIndex) string {
+	matches := re.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return text
+	}
+
+	var out strings.Builder
+	pos := 0
+	for _, span := range matches {
+		start, end := span[groupIndex], span[groupIndex+1]
+		if start < pos || start < 0 || end < 0 {
+			continue
+		}
+		out.WriteString(text[pos:start])
+		out.WriteString(ri.localizeURL(text[start:end]))
+		pos = end
+	}
+	out.WriteString(text[pos:])
+	return out.String()
 }
 
 func (ri *routeIndex) localizeURL(raw string) string {
@@ -242,37 +298,49 @@ func (ri *routeIndex) localizeURL(raw string) string {
 	if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "//") {
 		return raw
 	}
+	if hasURLScheme(trimmed) {
+		return raw
+	}
 
 	pathPart, suffix := splitURLSuffix(trimmed)
 	if !strings.HasPrefix(pathPart, "/") {
 		return raw
 	}
 
-	canonical := normalizeRoute(pathPart)
-	segment := firstPathSegment(strings.TrimPrefix(canonical, "/"))
-	if _, ok := ri.localePrefixes[segment]; segment != "" && ok {
+	normalized := normalizeRoute(pathPart)
+	if ri.routeHasLocalePrefix(normalized) {
 		return raw
 	}
 
-	seen := map[string]struct{}{canonical: {}}
-	for {
-		next, ok := ri.redirects[canonical]
-		if !ok {
-			break
-		}
-		if _, ok := seen[next]; ok {
-			return raw
-		}
-		seen[next] = struct{}{}
-		canonical = next
+	canonical, ok := ri.resolveRoute(normalized)
+	if !ok {
+		return raw
 	}
 	if _, ok := ri.localizedRoutes[canonical]; !ok {
 		return raw
 	}
-	if canonical == "/" {
-		canonical = ""
+
+	return prefixLocaleRoute(ri.targetLang, canonical) + suffix
+}
+
+func hasURLScheme(raw string) bool {
+	switch {
+	case hasSchemePrefix(raw, "http://"), hasSchemePrefix(raw, "https://"):
+		return true
+	case hasSchemePrefix(raw, "mailto:"), hasSchemePrefix(raw, "tel:"):
+		return true
+	case hasSchemePrefix(raw, "data:"), hasSchemePrefix(raw, "javascript:"), hasSchemePrefix(raw, "vbscript:"):
+		return true
+	default:
+		return false
 	}
-	return "/" + ri.targetLang + canonical + suffix
+}
+
+func hasSchemePrefix(raw, prefix string) bool {
+	if len(raw) < len(prefix) {
+		return false
+	}
+	return strings.EqualFold(raw[:len(prefix)], prefix)
 }
 
 func splitURLSuffix(raw string) (string, string) {
@@ -281,4 +349,60 @@ func splitURLSuffix(raw string) (string, string) {
 		return raw, ""
 	}
 	return raw[:index], raw[index:]
+}
+
+func prefixLocaleRoute(lang, route string) string {
+	if route == "/" {
+		return "/" + lang
+	}
+	return "/" + lang + route
+}
+
+func (ri *routeIndex) routeHasLocalePrefix(route string) bool {
+	if route == "/" {
+		return false
+	}
+	firstSegment := strings.TrimPrefix(route, "/")
+	firstSegment = strings.SplitN(firstSegment, "/", 2)[0]
+	return ri.isLocalePrefix(firstSegment)
+}
+
+func (ri *routeIndex) isLocalePrefix(segment string) bool {
+	if segment == "" {
+		return false
+	}
+	_, ok := ri.localePrefixes[segment]
+	return ok
+}
+
+func (ri *routeIndex) resolveRoute(route string) (string, bool) {
+	current := normalizeRoute(route)
+	if current == "" {
+		return "", false
+	}
+
+	seen := map[string]struct{}{current: {}}
+	for {
+		next, ok := ri.redirects[current]
+		if !ok {
+			break
+		}
+		current = next
+		if _, ok := seen[current]; ok {
+			return "", false
+		}
+		seen[current] = struct{}{}
+	}
+
+	if current == "/" {
+		_, ok := ri.localizedRoutes[current]
+		return current, ok
+	}
+	if _, ok := ri.sourceRoutes[current]; ok {
+		return current, true
+	}
+	if _, ok := ri.localizedRoutes[current]; ok {
+		return current, true
+	}
+	return "", false
 }
