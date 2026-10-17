@@ -1,11 +1,5 @@
-// Numeric CLI option parsers shared by dependency-free script planning helpers.
-
-/**
- * Parse a safe positive integer option.
- * @param {string | number} raw
- * @param {string} label
- * @returns {number}
- */
+// Numeric CLI option parsers shared by script planning helpers.
+/** Parse a safe positive integer option. */
 export function parsePositiveInt(raw, label) {
   const text = String(raw).trim();
   if (!/^\d+$/u.test(text)) {
@@ -18,34 +12,7 @@ export function parsePositiveInt(raw, label) {
   return value;
 }
 
-/**
- * Read a safe positive integer from an environment variable.
- * @param {string} name
- * @param {NodeJS.ProcessEnv} env
- * @param {number} fallback
- * @returns {number}
- */
-export function readPositiveEnvInt(name, env, fallback) {
-  const raw = env[name]?.trim();
-  if (raw === undefined || raw === "") {
-    return fallback;
-  }
-  if (!/^[1-9]\d*$/u.test(raw)) {
-    throw new Error(`invalid ${name}: ${raw}`);
-  }
-  const value = Number(raw);
-  if (!Number.isSafeInteger(value)) {
-    throw new Error(`invalid ${name}: ${raw}`);
-  }
-  return value;
-}
-
-/**
- * Parse a safe non-negative integer option.
- * @param {string | number} raw
- * @param {string} label
- * @returns {number}
- */
+/** Parse a safe non-negative integer option. */
 export function parseNonNegativeInt(raw, label) {
   const text = String(raw).trim();
   if (!/^\d+$/u.test(text)) {
@@ -58,30 +25,7 @@ export function parseNonNegativeInt(raw, label) {
   return value;
 }
 
-/**
- * Parse a safe non-negative integer written in canonical decimal notation.
- * @param {unknown} raw
- * @param {string} label
- * @returns {number}
- */
-export function parseStrictNonNegativeDecimal(raw, label) {
-  const text = String(raw).trim();
-  if (!/^(0|[1-9]\d*)$/u.test(text)) {
-    throw new Error(`${label} must be a non-negative integer`);
-  }
-  const value = Number(text);
-  if (!Number.isSafeInteger(value)) {
-    throw new Error(`${label} must be a safe integer`);
-  }
-  return value;
-}
-
-/**
- * Parse a finite positive number option.
- * @param {string | number} raw
- * @param {string} label
- * @returns {number}
- */
+/** Parse a finite positive number option. */
 export function parsePositiveNumber(raw, label) {
   const text = String(raw).trim();
   if (!/^(?:\d+(?:\.\d+)?|\.\d+)$/u.test(text)) {

@@ -1,17 +1,34 @@
+// Control Ui I18N Report script supports OpenClaw repository automation.
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { requireOptionArgument } from "./lib/arg-utils.mts";
-import { CONTROL_UI_LOCALE_ENTRIES, controlUiLanguageLabel } from "./lib/control-ui-i18n-config.ts";
-import type { RawCopyBaseline, RawCopyBaselineEntry } from "./lib/control-ui-i18n-raw-copy.ts";
-import type { LocaleMeta } from "./lib/control-ui-i18n-sync-plan.ts";
 
 const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const I18N_ASSETS_DIR = path.join(ROOT, "ui/src/i18n/.i18n");
 const RAW_COPY_BASELINE_PATH = path.join(I18N_ASSETS_DIR, "raw-copy-baseline.json");
 const DEFAULT_TOP = 10;
-const REPORT_LOCALES = new Set(CONTROL_UI_LOCALE_ENTRIES.map((entry) => entry.locale));
+const LOCALE_LABELS: Record<string, string> = {
+  ar: "Arabic",
+  de: "German",
+  es: "Spanish",
+  fa: "Persian",
+  fr: "French",
+  id: "Indonesian",
+  it: "Italian",
+  "ja-JP": "Japanese",
+  ko: "Korean",
+  nl: "Dutch",
+  pl: "Polish",
+  "pt-BR": "Brazilian Portuguese",
+  th: "Thai",
+  tr: "Turkish",
+  uk: "Ukrainian",
+  vi: "Vietnamese",
+  "zh-CN": "Simplified Chinese",
+  "zh-TW": "Traditional Chinese",
+};
+const REPORT_LOCALES = new Set(Object.keys(LOCALE_LABELS));
 const PATH_LABELS: Record<string, string> = {
   "ui/src/ui/chat/chat-queue.ts": "Chat queue",
   "ui/src/ui/chat/grouped-render.ts": "Chat message groups",
@@ -30,19 +47,46 @@ const PATH_LABELS: Record<string, string> = {
   "ui/src/ui/views/usage-render-overview.ts": "Usage overview",
 };
 
+type RawCopyKind = "html-attribute" | "html-text" | "object-property";
+
+export type RawCopyBaselineEntry = {
+  count: number;
+  kind: RawCopyKind;
+  name: string;
+  path: string;
+  text: string;
+};
+
+type RawCopyBaseline = {
+  entries: RawCopyBaselineEntry[];
+  version: number;
+};
+
+type LocaleMeta = {
+  fallbackKeys: string[];
+  generatedAt: string;
+  locale: string;
+  model: string;
+  provider: string;
+  sourceHash: string;
+  totalKeys: number;
+  translatedKeys: number;
+  workflow: number;
+};
+
 type ReportArgs = {
   locale?: string;
   surface?: string;
   top: number;
 };
 
-type RawCopySummary = {
+export type RawCopySummary = {
   entries: number;
   occurrences: number;
   topPaths: Array<{ count: number; path: string }>;
 };
 
-type LocaleSummary = {
+export type LocaleSummary = {
   fallbackKeysInScope: string[];
   meta: LocaleMeta;
 };
@@ -58,17 +102,20 @@ export function parseArgs(argv: string[]): ReportArgs {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--surface") {
-      args.surface = requireOptionArgument(argv, index++, arg);
+      args.surface = readOptionValue(argv, (index += 1), arg);
       continue;
     }
     if (arg === "--locale") {
-      args.locale = parseLocale(requireOptionArgument(argv, index++, arg));
+      args.locale = parseLocale(readOptionValue(argv, (index += 1), arg));
       continue;
     }
     if (arg === "--top") {
-      const raw = requireOptionArgument(argv, index++, arg);
+      const raw = readOptionValue(argv, (index += 1), arg);
+      if (!/^[1-9][0-9]*$/.test(raw)) {
+        throw new Error(`--top must be a positive integer: ${raw}`);
+      }
       const top = Number.parseInt(raw, 10);
-      if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(top)) {
+      if (!Number.isSafeInteger(top)) {
         throw new Error(`--top must be a positive integer: ${raw}`);
       }
       args.top = top;
@@ -77,6 +124,14 @@ export function parseArgs(argv: string[]): ReportArgs {
     throw new Error(`unknown argument: ${arg}\n${usage()}`);
   }
   return args;
+}
+
+function readOptionValue(argv: string[], index: number, flag: string) {
+  const value = argv[index];
+  if (!value || value.startsWith("--")) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return value;
 }
 
 function parseLocale(locale: string) {
@@ -91,7 +146,7 @@ export function filterRawCopyEntries(entries: RawCopyBaselineEntry[], surface?: 
     return entries;
   }
   const normalized = normalizeToken(surface);
-  return entries.filter((entry) => pathTokens(entry.path).includes(normalized));
+  return entries.filter((entry) => pathTokens(entry.path).some((token) => token === normalized));
 }
 
 export function summarizeRawCopy(entries: RawCopyBaselineEntry[], top: number): RawCopySummary {
@@ -105,13 +160,18 @@ export function summarizeRawCopy(entries: RawCopyBaselineEntry[], top: number): 
 
   const rankedPaths = [...byPath.entries()]
     .map(([entryPath, count]) => ({ count, path: entryPath }))
-    .toSorted((left, right) => right.count - left.count || left.path.localeCompare(right.path));
+    .toSorted(compareCountThenName((entry) => entry.path));
 
   return {
     entries: entries.length,
     occurrences,
     topPaths: rankedPaths.slice(0, top),
   };
+}
+
+function compareCountThenName<T>(nameOf: (value: T) => string) {
+  return (left: T & { count: number }, right: T & { count: number }) =>
+    right.count - left.count || nameOf(left).localeCompare(nameOf(right));
 }
 
 function pathTokens(repoPath: string) {
@@ -135,51 +195,87 @@ export function filterTranslationKeysBySurface(keys: string[], surface?: string)
     return keys;
   }
   const normalized = normalizeToken(surface);
-  return keys.filter((key) => surfaceTokens(key).includes(normalized));
+  return keys.filter((key) =>
+    key.split(".").some((part) => surfaceTokens(part).some((token) => token === normalized)),
+  );
 }
 
-export function formatReport({ locale, rawCopy, surface }: ReportInput) {
-  const scope = surface ? formatSurfaceLabel(surface) : "Control UI";
+export function formatReport(input: ReportInput) {
   const lines = [
     "Control UI i18n baseline report",
-    `Scope: ${formatSurfaceLabel(surface)}, ${
-      locale ? formatLocaleLabel(locale.meta.locale) : "no locale selected"
+    `Scope: ${formatSurfaceLabel(input.surface)}, ${
+      input.locale ? formatLocaleLabel(input.locale.meta.locale) : "no locale selected"
     }`,
     "Based on: current raw-copy baseline and locale metadata. Not a drift check.",
     "",
     "Current i18n state",
-    `  Hardcoded UI text outside i18n: ${rawCopy.entries} pieces in code, ${rawCopy.occurrences} total occurrences.`,
-    locale
-      ? `  Existing ${locale.meta.locale} translation keys (all Control UI): ${locale.meta.translatedKeys}/${locale.meta.totalKeys} filled, ${formatFallbackCount(locale.meta.fallbackKeys.length)}.`
-      : "  Existing translation keys: not checked. Add --locale <code> to include them.",
+    `  Hardcoded UI text outside i18n: ${input.rawCopy.entries} pieces in code, ${input.rawCopy.occurrences} total occurrences.`,
+    ...formatLocaleState(input.locale),
     "",
     "Current issue",
-    rawCopy.entries === 0
-      ? `  No hardcoded UI text found in ${scope}.`
-      : `  ${scope} still has UI text written directly in code.`,
-    !locale
-      ? "  Locale-specific gaps were not checked."
-      : locale.fallbackKeysInScope.length === 0
-        ? `  No ${locale.meta.locale} locale problems found in this scope.`
-        : `  ${locale.meta.locale} has ${formatMissingKeyCount(locale.fallbackKeysInScope.length)}.`,
+    ...formatIssueLines(input),
     "",
     "Focus modules",
-    ...(rawCopy.topPaths.length === 0
-      ? ["  none"]
-      : rawCopy.topPaths.map(
-          (entry) => `  ${entry.count} ${formatPathLabel(entry.path)}: ${entry.path}`,
-        )),
+    ...formatTopPathLines(input.rawCopy.topPaths),
     "",
     "Next steps",
-    ...(rawCopy.entries === 0
-      ? ["  No module work needed for hardcoded text in this scope."]
-      : [
-          "  Move text from the focus modules into translation keys.",
-          "  Do not hand-edit generated locale, translation memory, or i18n metadata files.",
-          "  Run pnpm ui:i18n:sync after adding translation keys.",
-        ]),
+    ...formatNextStepLines(input),
   ];
+
   return `${lines.join("\n")}\n`;
+}
+
+function formatLocaleState(locale?: LocaleSummary) {
+  if (!locale) {
+    return ["  Existing translation keys: not checked. Add --locale <code> to include them."];
+  }
+  return [
+    `  Existing ${locale.meta.locale} translation keys (all Control UI): ${locale.meta.translatedKeys}/${locale.meta.totalKeys} filled, ${formatFallbackCount(locale.meta.fallbackKeys.length)}.`,
+  ];
+}
+
+function formatIssueLines(input: ReportInput) {
+  const scope = input.surface ? formatSurfaceLabel(input.surface) : "Control UI";
+  const lines: string[] = [];
+
+  if (input.rawCopy.entries === 0) {
+    lines.push(`  No hardcoded UI text found in ${scope}.`);
+  } else {
+    lines.push(`  ${scope} still has UI text written directly in code.`);
+  }
+
+  if (!input.locale) {
+    lines.push("  Locale-specific gaps were not checked.");
+    return lines;
+  }
+
+  if (input.locale.fallbackKeysInScope.length === 0) {
+    lines.push(`  No ${input.locale.meta.locale} locale problems found in this scope.`);
+    return lines;
+  }
+
+  lines.push(
+    `  ${input.locale.meta.locale} has ${formatMissingKeyCount(input.locale.fallbackKeysInScope.length)}.`,
+  );
+  return lines;
+}
+
+function formatNextStepLines(input: ReportInput) {
+  if (input.rawCopy.entries === 0) {
+    return ["  No module work needed for hardcoded text in this scope."];
+  }
+  return [
+    "  Move text from the focus modules into translation keys.",
+    "  Do not hand-edit generated locale, translation memory, or i18n metadata files.",
+    "  Run pnpm ui:i18n:sync after adding translation keys.",
+  ];
+}
+
+function formatTopPathLines(entries: Array<{ count: number; path: string }>) {
+  if (entries.length === 0) {
+    return ["  none"];
+  }
+  return entries.map((entry) => `  ${entry.count} ${formatPathLabel(entry.path)}: ${entry.path}`);
 }
 
 function formatMissingKeyCount(count: number) {
@@ -191,11 +287,15 @@ function formatFallbackCount(count: number) {
 }
 
 function formatSurfaceLabel(surface?: string) {
-  return surface ? toTitleWords(surface) : "all Control UI";
+  if (!surface) {
+    return "all Control UI";
+  }
+  return toTitleWords(surface);
 }
 
 function formatLocaleLabel(locale: string) {
-  return REPORT_LOCALES.has(locale) ? `${controlUiLanguageLabel(locale)} (${locale})` : locale;
+  const label = LOCALE_LABELS[locale];
+  return label ? `${label} (${locale})` : locale;
 }
 
 function formatPathLabel(repoPath: string) {
@@ -252,7 +352,12 @@ function usage() {
   ].join("\n");
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+function isCliEntrypoint() {
+  const entrypoint = process.argv[1];
+  return Boolean(entrypoint && import.meta.url === pathToFileURL(path.resolve(entrypoint)).href);
+}
+
+if (isCliEntrypoint()) {
   const cliArgs = process.argv.slice(2);
   if (cliArgs.includes("--help") || cliArgs.includes("-h")) {
     process.stdout.write(`${usage()}\n`);

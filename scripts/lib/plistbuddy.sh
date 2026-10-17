@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 plist_escape_string() {
   local value="$1"

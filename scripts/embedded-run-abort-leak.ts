@@ -18,11 +18,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { setImmediate, setTimeout } from "node:timers/promises";
 import * as v8 from "node:v8";
-import { expectDefined } from "../packages/normalization-core/src/expect.js";
-import { coerceErrorMessage, toErrorObject as toLintErrorObject } from "./lib/error-format.mts";
-import { parseNonNegativeInt, parsePositiveInt } from "./lib/numeric-options.mjs";
 
 type Mode = "production" | "closure-extracted" | "closure-inline" | "synthetic-leak";
 type Abortable = <T>(signal: AbortSignal, promise: Promise<T>) => Promise<T>;
@@ -38,24 +34,6 @@ type Options = {
   quiet: boolean;
 };
 
-const VALUE_FLAGS = new Set([
-  "--iters",
-  "--batches",
-  "--snap-dir",
-  "--mode",
-  "--max-rss-growth-mb",
-  "--max-tracked-retention",
-  "--scope-bytes",
-]);
-
-function readValue(raw: string | undefined, flag: string): string {
-  const value = raw?.trim() ?? "";
-  if (!value || value.startsWith("-")) {
-    fail(`${flag} requires a value`);
-  }
-  return value;
-}
-
 function parseArgs(argv: string[]): Options {
   const opts: Options = {
     iters: 50,
@@ -67,51 +45,48 @@ function parseArgs(argv: string[]): Options {
     scopeBytes: 2_000_000,
     quiet: false,
   };
-  const seenValueFlags = new Set<string>();
   for (let i = 0; i < argv.length; i += 1) {
-    const arg = expectDefined(argv[i], `embedded abort benchmark argument at index ${i}`);
-    let value = "";
-    if (VALUE_FLAGS.has(arg)) {
-      if (seenValueFlags.has(arg)) {
-        fail(`${arg} was provided more than once`);
-      }
-      seenValueFlags.add(arg);
-      value = readValue(argv[++i], arg);
-    }
+    const arg = argv[i];
+    const next = argv[i + 1];
     switch (arg) {
       case "--iters":
-        opts.iters = parsePositiveInt(value, arg);
+        opts.iters = parsePositiveInt(next, arg);
+        i += 1;
         break;
       case "--batches":
-        opts.batches = parsePositiveInt(value, arg);
+        opts.batches = parsePositiveInt(next, arg);
+        i += 1;
         break;
       case "--snap-dir":
-        opts.snapDir = value;
+        opts.snapDir = next ?? opts.snapDir;
+        i += 1;
         break;
-      case "--mode": {
-        const mode = value;
+      case "--mode":
         if (
-          mode === "production" ||
-          mode === "closure-extracted" ||
-          mode === "closure-inline" ||
-          mode === "synthetic-leak"
+          next === "production" ||
+          next === "closure-extracted" ||
+          next === "closure-inline" ||
+          next === "synthetic-leak"
         ) {
-          opts.mode = mode;
+          opts.mode = next;
         } else {
           fail(
             `--mode must be one of: production, closure-extracted, closure-inline, synthetic-leak`,
           );
         }
+        i += 1;
         break;
-      }
       case "--max-rss-growth-mb":
-        opts.maxRssGrowthMb = parseNonNegativeInt(value, arg);
+        opts.maxRssGrowthMb = parseNonNegativeInt(next, arg);
+        i += 1;
         break;
       case "--max-tracked-retention":
-        opts.maxTrackedRetention = parseNonNegativeInt(value, arg);
+        opts.maxTrackedRetention = parseNonNegativeInt(next, arg);
+        i += 1;
         break;
       case "--scope-bytes":
-        opts.scopeBytes = parsePositiveInt(value, arg);
+        opts.scopeBytes = parsePositiveInt(next, arg);
+        i += 1;
         break;
       case "--quiet":
         opts.quiet = true;
@@ -120,11 +95,50 @@ function parseArgs(argv: string[]): Options {
       case "-h":
         printUsage();
         process.exit(0);
+        break;
       default:
         fail(`Unknown arg: ${arg}`);
     }
   }
+  if (!Number.isFinite(opts.iters) || opts.iters <= 0) {
+    fail("--iters must be > 0");
+  }
+  if (!Number.isFinite(opts.batches) || opts.batches <= 0) {
+    fail("--batches must be > 0");
+  }
   return opts;
+}
+
+function parsePositiveInt(raw: string | undefined, flag: string): number {
+  const value = parseStrictInt(raw, flag, "positive");
+  if (value <= 0) {
+    fail(`${flag} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseNonNegativeInt(raw: string | undefined, flag: string): number {
+  const value = parseStrictInt(raw, flag, "non-negative");
+  if (value < 0) {
+    fail(`${flag} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function parseStrictInt(
+  raw: string | undefined,
+  flag: string,
+  label: "positive" | "non-negative",
+): number {
+  const text = (raw ?? "").trim();
+  if (!/^\d+$/u.test(text)) {
+    fail(`${flag} must be a ${label} integer`);
+  }
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) {
+    fail(`${flag} must be a ${label} integer`);
+  }
+  return value;
 }
 
 function printUsage(): void {
@@ -156,6 +170,13 @@ const finalizer = new FinalizationRegistry<number>(() => {
   FINALIZED.count += 1;
 });
 let productionAbortable: Abortable | null = null;
+
+async function loadProductionAbortable(): Promise<void> {
+  const module = (await import("../src/agents/embedded-agent-runner/run/abortable.js")) as {
+    abortable: Abortable;
+  };
+  productionAbortable = module.abortable;
+}
 
 function abortableExtracted<T>(signal: AbortSignal, promise: Promise<T>): Promise<T> {
   if (signal.aborted) {
@@ -236,14 +257,19 @@ function runOnce(mode: Mode, scopeBytes: number, iter: number): void {
 
 async function settleAndGc(): Promise<void> {
   for (let i = 0; i < 4; i += 1) {
-    await setImmediate();
+    await new Promise<void>((r) => {
+      setImmediate(r);
+    });
     globalThis.gc?.();
   }
-  await setTimeout(100);
+  await new Promise<void>((r) => {
+    setTimeout(r, 100);
+  });
   globalThis.gc?.();
 }
 
 type SampleRow = {
+  label: string;
   rssBytes: number;
   heapUsedBytes: number;
   totalIters: number;
@@ -251,17 +277,11 @@ type SampleRow = {
   snapshotPath: string;
 };
 
-function takeSnapshot(snapDir: string, label: string, totalIters: number): SampleRow {
+function takeSnapshot(snapDir: string, label: string): string {
   fs.mkdirSync(snapDir, { recursive: true });
-  const snapshotPath = path.join(snapDir, `${label}-${process.pid}-${Date.now()}.heapsnapshot`);
-  v8.writeHeapSnapshot(snapshotPath);
-  return {
-    rssBytes: process.memoryUsage().rss,
-    heapUsedBytes: process.memoryUsage().heapUsed,
-    totalIters,
-    trackedFinalized: FINALIZED.count,
-    snapshotPath,
-  };
+  const filename = path.join(snapDir, `${label}-${process.pid}-${Date.now()}.heapsnapshot`);
+  v8.writeHeapSnapshot(filename);
+  return filename;
 }
 
 function fmtBytes(bytes: number): string {
@@ -269,21 +289,16 @@ function fmtBytes(bytes: number): string {
 }
 
 async function main(): Promise<void> {
-  let opts: Options;
-  try {
-    opts = parseArgs(process.argv.slice(2));
-  } catch (error) {
-    fail(coerceErrorMessage(error));
-  }
+  const opts = parseArgs(process.argv.slice(2));
   if (opts.mode === "production") {
-    productionAbortable = (await import("../src/agents/embedded-agent-runner/run/abortable.js"))
-      .abortable;
+    await loadProductionAbortable();
   }
   if (typeof globalThis.gc !== "function") {
     fail("--expose-gc is required (run with: node --expose-gc ...)");
   }
 
   const startedAt = Date.now();
+  const samples: SampleRow[] = [];
 
   if (!opts.quiet) {
     process.stdout.write(
@@ -293,8 +308,16 @@ async function main(): Promise<void> {
   }
 
   await settleAndGc();
-  const baseline = takeSnapshot(opts.snapDir, "baseline", 0);
-  let final = baseline;
+  const baselinePath = takeSnapshot(opts.snapDir, "baseline");
+  const baseline: SampleRow = {
+    label: "baseline",
+    rssBytes: process.memoryUsage().rss,
+    heapUsedBytes: process.memoryUsage().heapUsed,
+    totalIters: 0,
+    trackedFinalized: FINALIZED.count,
+    snapshotPath: baselinePath,
+  };
+  samples.push(baseline);
   if (!opts.quiet) {
     process.stdout.write(
       `  baseline rss=${fmtBytes(baseline.rssBytes)} heap=${fmtBytes(baseline.heapUsedBytes)}\n`,
@@ -308,8 +331,16 @@ async function main(): Promise<void> {
       totalIters += 1;
     }
     await settleAndGc();
-    const row = takeSnapshot(opts.snapDir, `batch-${b}`, totalIters);
-    final = row;
+    const snapshotPath = takeSnapshot(opts.snapDir, `batch-${b}`);
+    const row: SampleRow = {
+      label: `batch-${b}`,
+      rssBytes: process.memoryUsage().rss,
+      heapUsedBytes: process.memoryUsage().heapUsed,
+      totalIters,
+      trackedFinalized: FINALIZED.count,
+      snapshotPath,
+    };
+    samples.push(row);
     if (!opts.quiet) {
       process.stdout.write(
         `  batch ${b} totalIters=${row.totalIters} ` +
@@ -319,7 +350,13 @@ async function main(): Promise<void> {
     }
   }
 
+  const final = samples[samples.length - 1];
+  if (!final) {
+    fail("no samples collected");
+  }
   const rssGrowthMb = (final.rssBytes - baseline.rssBytes) / 1024 / 1024;
+  // Tracked retention: how many iter-allocated transcripts are STILL alive
+  // (have not been finalized). Lower is better.
   const trackedRetention = final.totalIters - final.trackedFinalized;
 
   const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -349,3 +386,17 @@ main().catch((err: unknown) => {
   process.stderr.write(`harness crashed: ${String(err)}\n${(err as Error)?.stack ?? ""}\n`);
   process.exit(2);
 });
+
+function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
+  if (value instanceof Error) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return new Error(value);
+  }
+  const error = new Error(fallbackMessage, { cause: value });
+  if ((typeof value === "object" && value !== null) || typeof value === "function") {
+    Object.assign(error, value);
+  }
+  return error;
+}

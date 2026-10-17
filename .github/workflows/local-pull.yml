@@ -1,0 +1,27 @@
+name: Pull local clone
+
+on:
+  workflow_run:
+    workflows: ["Sync fork with upstream"]
+    types: [completed]
+
+jobs:
+  pull:
+    if: >-
+      vars.MAC_RUNNER == 'true' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, macOS]
+    steps:
+      - name: Sync local OpenClaw clone to fork main
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$HOME/openclaw"
+          if [[ ! -d "$dir/.git" ]]; then
+            echo "Skip $dir (not a git repo)"
+            exit 0
+          fi
+          echo "Syncing $dir"
+          git -C "$dir" fetch origin main
+          git -C "$dir" reset --hard origin/main
+          git -C "$dir" log -1 --oneline

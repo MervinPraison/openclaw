@@ -1,15 +1,14 @@
 {
-  "ownership": "explicit",
   "defaults": {
     "model": {
       "primary": "openai/gpt-5.5"
     },
-    "heartbeat": {
-      "every": "0m"
-    }
+    "contextTokens": 64000
   },
-  "entries": {
-    "main": {
+  "list": [
+    {
+      "id": "main",
+      "default": true,
       "name": "Main",
       "workspace": "~/workspace",
       "model": {
@@ -18,7 +17,8 @@
       "thinkingDefault": "low",
       "skills": ["memory"]
     },
-    "ops": {
+    {
+      "id": "ops",
       "name": "Ops",
       "workspace": "~/workspace/ops",
       "model": {
@@ -26,5 +26,5 @@
       },
       "fastModeDefault": true
     }
-  }
+  ]
 }
