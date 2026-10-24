@@ -1,11 +1,9 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {
-    "allowJs": true,
     "noEmit": true,
-    "rootDir": "..",
     "types": ["node"]
   },
-  "include": ["**/*.ts", "**/*.mts"],
+  "include": ["**/*.ts"],
   "exclude": ["pre-commit/**"]
 }
