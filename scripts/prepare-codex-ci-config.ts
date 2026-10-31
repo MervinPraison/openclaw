@@ -1,7 +1,6 @@
 // Prepare Codex Ci Config script supports OpenClaw repository automation.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { expectDefined } from "../packages/normalization-core/src/expect.js";
 
 function tomlString(value: string): string {
   return JSON.stringify(value);
@@ -51,7 +50,7 @@ export async function writeCiSafeCodexConfig(params: {
 }
 
 if (path.basename(process.argv[1] ?? "") === "prepare-codex-ci-config.ts") {
-  const outputPath = expectDefined(process.argv[2], "Codex CI config output path");
+  const outputPath = process.argv[2];
   const projectPath = process.argv[3] ?? process.cwd();
   await writeCiSafeCodexConfig({ outputPath, projectPath });
 }
