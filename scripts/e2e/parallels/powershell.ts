@@ -1,7 +1,17 @@
-import { modelProviderConfigBatchJson, providerIdFromModelId } from "./provider-auth.ts";
+// Powershell script supports OpenClaw repository automation.
+import {
+  configPathMapKey,
+  modelProviderConfigBatchJson,
+  providerIdFromModelId,
+  providerTimeoutConfigJson,
+} from "./provider-auth.ts";
 
 export function psSingleQuote(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
+}
+
+export function psArray(values: string[]): string {
+  return `@(${values.map(psSingleQuote).join(", ")})`;
 }
 
 export function encodePowerShell(script: string): string {
@@ -9,36 +19,6 @@ export function encodePowerShell(script: string): string {
     "base64",
   );
 }
-
-export function windowsPackageInstallScript(tgzUrl: string, tempName: string): string {
-  return `$ErrorActionPreference = 'Stop'
-$tgz = Join-Path $env:TEMP ${psSingleQuote(tempName)}
-curl.exe -fsSL --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 ${psSingleQuote(tgzUrl)} -o $tgz
-# Windows PowerShell treats native stderr notices as errors under Stop.
-$ErrorActionPreference = 'Continue'
-npm.cmd install -g $tgz --no-fund --no-audit --loglevel=error
-$ErrorActionPreference = 'Stop'
-if ($LASTEXITCODE -ne 0) { throw "npm install failed with exit code $LASTEXITCODE" }
-$npmPrefix = (& npm.cmd prefix -g | Select-Object -Last 1)
-if ($LASTEXITCODE -ne 0 -or -not $npmPrefix -or -not (Test-Path -LiteralPath (Join-Path $npmPrefix 'openclaw.cmd') -PathType Leaf)) {
-  throw 'npm global prefix does not contain the installed openclaw.cmd'
-}
-# Packed fixtures need the same persistent CLI handoff as the site installer.
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if (-not (@($userPath -split ';') | Where-Object { $_ -ieq $npmPrefix })) {
-  $newUserPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $npmPrefix } else { "$userPath;$npmPrefix" }
-  [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
-}
-$env:PATH = "$npmPrefix;$env:PATH"
-Invoke-OpenClaw --version
-if ($LASTEXITCODE -ne 0) { throw "openclaw --version failed with exit code $LASTEXITCODE" }`;
-}
-
-export const windowsFreshShellVersionScript = `& powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodePowerShell(String.raw`$ErrorActionPreference = 'Stop'
-$env:PATH = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
-& openclaw.cmd --version
-if ($LASTEXITCODE -ne 0) { throw "fresh-shell openclaw --version failed with exit code $LASTEXITCODE" }`)}
-if ($LASTEXITCODE -ne 0) { throw "fresh-shell CLI failed with exit code $LASTEXITCODE" }`;
 
 export const windowsScopedEnvFunction = String.raw`function Invoke-WithScopedEnv {
   param(
@@ -62,6 +42,37 @@ export const windowsScopedEnvFunction = String.raw`function Invoke-WithScopedEnv
     }
   }
 }`;
+
+export function windowsModelProviderTimeoutScript(modelId: string): string {
+  const providerId = providerIdFromModelId(modelId);
+  const configJson = providerTimeoutConfigJson(modelId, "windows");
+  if (!providerId || !configJson) {
+    return "";
+  }
+  const batchJson = JSON.stringify([
+    {
+      path: `models.providers.${providerId}`,
+      value: JSON.parse(configJson) as unknown,
+    },
+    {
+      path: `agents.defaults.models${configPathMapKey(modelId)}`,
+      value: {
+        alias: "GPT",
+        params: {
+          transport: "sse",
+        },
+      },
+    },
+  ]);
+  return `$providerTimeoutBatchPath = Join-Path ([System.IO.Path]::GetTempPath()) 'openclaw-provider-timeout.batch.json'
+@'
+${batchJson}
+'@ | Set-Content -Path $providerTimeoutBatchPath -Encoding UTF8
+Invoke-OpenClaw config set --batch-file $providerTimeoutBatchPath --strict-json
+$providerTimeoutExit = $LASTEXITCODE
+Remove-Item $providerTimeoutBatchPath -Force -ErrorAction SilentlyContinue
+if ($providerTimeoutExit -ne 0) { throw "model provider timeout config set failed" }`;
+}
 
 export function windowsAgentTurnConfigPatchScript(modelId: string): string {
   const batchJson = modelProviderConfigBatchJson(modelId, "windows");
@@ -220,40 +231,3 @@ function Invoke-OpenClaw {
     $PSNativeCommandUseErrorActionPreference = $previousNativeErrorActionPreference
   }
 }`;
-
-export function windowsAgentTurnScript(input: {
-  command: string;
-  sessionId: string;
-  retryOnCommandFailure: boolean;
-}): string {
-  return `$agentOk = $false
-for ($attempt = 1; $attempt -le 2; $attempt++) {
-  $sessionId = if ($attempt -eq 1) { ${psSingleQuote(input.sessionId)} } else { "${input.sessionId}-retry-$attempt" }
-  $sessionsDir = Join-Path $env:USERPROFILE '.openclaw\\agents\\main\\sessions'
-  $sessionPath = Join-Path $sessionsDir "$sessionId.jsonl"
-  Remove-Item $sessionPath -Force -ErrorAction SilentlyContinue
-${input.command}
-  $agentExitCode = $LASTEXITCODE
-  if ($null -ne $output) { $output | ForEach-Object { $_ } }
-  if ($agentExitCode -eq 0 -and ($output | Out-String) -match '"finalAssistant(Raw|Visible)Text":\\s*"OK"') {
-    $agentOk = $true
-    break
-  }
-  if ($agentExitCode -ne 0 -and $attempt -lt 2 -and (Repair-MissingCodexPlatformPackage -Output $output)) {
-    Write-Host "agent turn attempt $attempt hit a missing Codex platform package; retrying"
-    continue
-  }
-  if ($attempt -lt 2) {
-    Write-Host "agent turn attempt $attempt ${input.retryOnCommandFailure ? "failed or " : ""}finished without OK response; retrying"
-    Start-Sleep -Seconds 3${input.retryOnCommandFailure ? "\n    continue" : ""}
-  }
-${
-  input.retryOnCommandFailure
-    ? `  if ($agentExitCode -ne 0) {
-    throw "agent failed with exit code $agentExitCode"
-  }`
-    : `  if ($agentExitCode -ne 0) { throw "agent failed with exit code $agentExitCode" }`
-}
-}
-if (-not $agentOk) { throw 'openclaw agent finished without OK response' }`;
-}

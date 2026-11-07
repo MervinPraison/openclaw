@@ -1,3 +1,4 @@
+// Cron Mcp Cleanup Docker Client script supports OpenClaw repository automation.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -6,12 +7,12 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import type { GatewayRpcClient } from "../../test/e2e/qa-lab/runtime/mcp-channels.fixture.ts";
 import { readPositiveIntEnv } from "./lib/env-limits.mjs";
+import type { GatewayRpcClient } from "./mcp-channels-harness.ts";
 
 const execFileAsync = promisify(execFile);
 const PROBE_PID_WAIT_MS = readCronMcpCleanupProbePidWaitMs();
-type McpChannelsHarness = typeof import("../../test/e2e/qa-lab/runtime/mcp-channels.fixture.ts");
+type McpChannelsHarness = typeof import("./mcp-channels-harness.ts");
 let mcpChannelsHarness: McpChannelsHarness | undefined;
 
 type CronJob = { id?: string };
@@ -20,7 +21,7 @@ type AgentRunResult = { runId?: string; status?: string };
 type CronFinishedPayload = { status?: unknown };
 
 async function loadMcpChannelsHarness(): Promise<McpChannelsHarness> {
-  mcpChannelsHarness ??= await import("../../test/e2e/qa-lab/runtime/mcp-channels.fixture.ts");
+  mcpChannelsHarness ??= await import("./mcp-channels-harness.ts");
   return mcpChannelsHarness;
 }
 
@@ -34,18 +35,11 @@ export function assertCronFinishedOk(finished: CronFinishedPayload | undefined):
   }
 }
 
-function parseProbePid(raw: string): number | undefined {
-  const text = raw.trim();
-  if (!/^[1-9]\d*$/u.test(text)) {
-    return undefined;
-  }
-  const pid = Number(text);
-  return Number.isSafeInteger(pid) ? pid : undefined;
-}
-
 async function readProbePid(pidPath: string): Promise<number | undefined> {
   try {
-    return parseProbePid(await fs.readFile(pidPath, "utf-8"));
+    const raw = (await fs.readFile(pidPath, "utf-8")).trim();
+    const pid = Number.parseInt(raw, 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
   } catch {
     return undefined;
   }
@@ -57,8 +51,8 @@ async function readProbePids(pidsPath: string): Promise<number[]> {
     const pids: number[] = [];
     const seen = new Set<number>();
     for (const line of raw.split(/\r?\n/)) {
-      const pid = parseProbePid(line);
-      if (pid === undefined || seen.has(pid)) {
+      const pid = Number.parseInt(line.trim(), 10);
+      if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) {
         continue;
       }
       seen.add(pid);
@@ -147,13 +141,21 @@ async function waitForAllProbeExits(params: {
   );
 }
 
+async function resetProbeFiles(params: {
+  pidPath: string;
+  pidsPath: string;
+  exitPath: string;
+}): Promise<void> {
+  await fs.rm(params.pidPath, { force: true });
+  await fs.rm(params.pidsPath, { force: true });
+  await fs.rm(params.exitPath, { force: true });
+}
+
 async function runCronCleanupScenario(params: {
   gateway: GatewayRpcClient;
   pidPath: string;
 }): Promise<{ jobId: string; runId?: string; pid: number; status?: unknown }> {
-  const harness = await loadMcpChannelsHarness();
-  const assert: McpChannelsHarness["assert"] = harness.assert;
-  const { waitFor } = harness;
+  const { assert, waitFor } = await loadMcpChannelsHarness();
   const { gateway, pidPath } = params;
   const job = await gateway.request<CronJob>("cron.add", {
     name: "cron mcp cleanup docker e2e",
@@ -236,12 +238,9 @@ async function runSubagentCleanupScenario(params: {
   pidsPath: string;
   exitPath: string;
 }): Promise<{ runId: string; exitedPids: number[]; pids: number[] }> {
-  const harness = await loadMcpChannelsHarness();
-  const assert: McpChannelsHarness["assert"] = harness.assert;
+  const { assert } = await loadMcpChannelsHarness();
   const { gateway, pidPath, pidsPath, exitPath } = params;
-  await fs.rm(pidPath, { force: true });
-  await fs.rm(pidsPath, { force: true });
-  await fs.rm(exitPath, { force: true });
+  await resetProbeFiles({ pidPath, pidsPath, exitPath });
 
   const run = await gateway.request<AgentRunResult>(
     "agent",
@@ -289,9 +288,7 @@ async function runSubagentCleanupScenario(params: {
 }
 
 async function main() {
-  const harness = await loadMcpChannelsHarness();
-  const assert: McpChannelsHarness["assert"] = harness.assert;
-  const { connectGateway } = harness;
+  const { assert, connectGateway } = await loadMcpChannelsHarness();
   const gatewayUrl = process.env.GW_URL?.trim();
   const gatewayToken = process.env.GW_TOKEN?.trim();
   const stateDir = process.env.OPENCLAW_STATE_DIR?.trim() || path.join(os.homedir(), ".openclaw");
@@ -301,11 +298,7 @@ async function main() {
   assert(gatewayUrl, "missing GW_URL");
   assert(gatewayToken, "missing GW_TOKEN");
 
-  const gateway = await connectGateway({
-    url: gatewayUrl,
-    token: gatewayToken,
-    bindFreshDevice: true,
-  });
+  const gateway = await connectGateway({ url: gatewayUrl, token: gatewayToken });
   try {
     const cron = await runCronCleanupScenario({ gateway, pidPath });
     const subagent = await runSubagentCleanupScenario({ gateway, pidPath, pidsPath, exitPath });
