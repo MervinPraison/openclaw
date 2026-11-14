@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"io"
-	"sort"
 	"strings"
 
 	"github.com/yuin/goldmark"
@@ -11,7 +10,14 @@ import (
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/text"
 	"golang.org/x/net/html"
+	"sort"
 )
+
+type htmlReplacement struct {
+	Start int
+	Stop  int
+	Value string
+}
 
 func translateHTMLBlocks(ctx context.Context, translator docsTranslator, body, srcLang, tgtLang string) (string, error) {
 	source := []byte(body)
@@ -21,9 +27,9 @@ func translateHTMLBlocks(ctx context.Context, translator docsTranslator, body, s
 	)
 	doc := md.Parser().Parse(r)
 
-	replacements := make([]Segment, 0, 8)
+	replacements := make([]htmlReplacement, 0, 8)
 
-	err := ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			return ast.WalkContinue, nil
 		}
@@ -31,7 +37,7 @@ func translateHTMLBlocks(ctx context.Context, translator docsTranslator, body, s
 		if !ok {
 			return ast.WalkContinue, nil
 		}
-		start, stop, ok := htmlBlockSpan(block)
+		start, stop, ok := htmlBlockSpan(block, source)
 		if !ok {
 			return ast.WalkSkipChildren, nil
 		}
@@ -40,27 +46,53 @@ func translateHTMLBlocks(ctx context.Context, translator docsTranslator, body, s
 		if err != nil {
 			return ast.WalkStop, err
 		}
-		replacements = append(replacements, Segment{Start: start, Stop: stop, Translated: translated})
+		replacements = append(replacements, htmlReplacement{Start: start, Stop: stop, Value: translated})
 		return ast.WalkSkipChildren, nil
 	})
 
-	if err != nil {
-		return "", err
+	if len(replacements) == 0 {
+		return body, nil
 	}
-	sort.Slice(replacements, func(i, j int) bool {
-		return replacements[i].Start < replacements[j].Start
-	})
-	return applyTranslations(body, replacements), nil
+
+	return applyHTMLReplacements(body, replacements), nil
 }
 
-func htmlBlockSpan(block *ast.HTMLBlock) (int, int, bool) {
+func htmlBlockSpan(block *ast.HTMLBlock, source []byte) (int, int, bool) {
 	lines := block.Lines()
 	if lines.Len() == 0 {
 		return 0, 0, false
 	}
 	start := lines.At(0).Start
 	stop := lines.At(lines.Len() - 1).Stop
-	return start, stop, start < stop
+	if start >= stop {
+		return 0, 0, false
+	}
+	return start, stop, true
+}
+
+func applyHTMLReplacements(body string, replacements []htmlReplacement) string {
+	if len(replacements) == 0 {
+		return body
+	}
+	sortHTMLReplacements(replacements)
+	var out strings.Builder
+	last := 0
+	for _, rep := range replacements {
+		if rep.Start < last {
+			continue
+		}
+		out.WriteString(body[last:rep.Start])
+		out.WriteString(rep.Value)
+		last = rep.Stop
+	}
+	out.WriteString(body[last:])
+	return out.String()
+}
+
+func sortHTMLReplacements(replacements []htmlReplacement) {
+	sort.Slice(replacements, func(i, j int) bool {
+		return replacements[i].Start < replacements[j].Start
+	})
 }
 
 func translateHTMLBlock(ctx context.Context, translator docsTranslator, htmlText, srcLang, tgtLang string) (string, error) {
@@ -91,8 +123,10 @@ func translateHTMLBlock(ctx context.Context, translator docsTranslator, htmlText
 			if isSkipTag(strings.ToLower(tok.Data)) && skipDepth > 0 {
 				skipDepth--
 			}
+		case html.SelfClosingTagToken:
+			out.WriteString(raw)
 		case html.TextToken:
-			if skipDepth == 0 && strings.TrimSpace(raw) != "" {
+			if shouldTranslateHTMLText(skipDepth, raw) {
 				translated, err := translator.Translate(ctx, raw, srcLang, tgtLang)
 				if err != nil {
 					return "", err
@@ -107,6 +141,13 @@ func translateHTMLBlock(ctx context.Context, translator docsTranslator, htmlText
 	}
 
 	return out.String(), nil
+}
+
+func shouldTranslateHTMLText(skipDepth int, text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	return skipDepth == 0
 }
 
 func isSkipTag(tag string) bool {

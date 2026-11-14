@@ -1,7 +1,7 @@
 name: Maintainer Command Reactions
 
 on:
-  issue_comment: # zizmor: ignore[dangerous-triggers] -- No checkout or user-code execution; the literal script checks repository permission before reacting.
+  issue_comment:
     types: [created, edited]
 
 permissions: {}
@@ -12,18 +12,7 @@ concurrency:
 
 jobs:
   react:
-    # Defaults need a tracked prefix; arbitrary custom commands keep the full matcher.
-    if: >-
-      ${{ (
-        !endsWith(github.actor, '[bot]') &&
-        (
-          vars.MAINTAINER_COMMAND_REACTIONS != '' ||
-          contains(github.event.comment.body, '/autoclose') ||
-          contains(github.event.comment.body, '/clawsweeper ') ||
-          contains(github.event.comment.body, '/merge') ||
-          contains(github.event.comment.body, '/land')
-        )
-      ) }}
+    if: ${{ !endsWith(github.actor, '[bot]') }}
     runs-on: ubuntu-24.04
     permissions:
       issues: write
@@ -32,7 +21,7 @@ jobs:
       MAINTAINER_COMMAND_REACTIONS: ${{ vars.MAINTAINER_COMMAND_REACTIONS || '/autoclose,/clawsweeper autoclose,/clawsweeper automerge,/merge,/land,/landpr' }}
     steps:
       - name: React to maintainer slash command
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        uses: actions/github-script@v9
         with:
           script: |
             const comment = context.payload.comment;

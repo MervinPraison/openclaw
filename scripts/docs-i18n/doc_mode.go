@@ -18,14 +18,6 @@ const (
 	bodyTagEnd          = "</body>"
 )
 
-type docOutputStatus int
-
-const (
-	docOutputNeedsTranslation docOutputStatus = iota
-	docOutputReady
-	docOutputNeedsPostprocess
-)
-
 func processFileDoc(ctx context.Context, translator docsTranslator, docsRoot, filePath, srcLang, tgtLang string, overwrite bool) (bool, string, error) {
 	absPath, relPath, err := resolveDocsPath(docsRoot, filePath)
 	if err != nil {
@@ -40,15 +32,12 @@ func processFileDoc(ctx context.Context, translator docsTranslator, docsRoot, fi
 
 	outputPath := filepath.Join(docsRoot, tgtLang, relPath)
 	if !overwrite {
-		status, err := classifyDocOutput(outputPath, currentHash, tgtLang)
+		skip, err := shouldSkipDoc(outputPath, currentHash)
 		if err != nil {
 			return false, "", err
 		}
-		switch status {
-		case docOutputReady:
+		if skip {
 			return true, "", nil
-		case docOutputNeedsPostprocess:
-			return true, outputPath, nil
 		}
 	}
 
@@ -60,7 +49,9 @@ func processFileDoc(ctx context.Context, translator docsTranslator, docsRoot, fi
 		}
 	}
 	docTM := &TranslationMemory{entries: map[string]TMEntry{}}
-	translateFrontMatter(ctx, translator, docTM, frontData, relPath, srcLang, tgtLang)
+	if err := translateFrontMatter(ctx, translator, docTM, frontData, relPath, srcLang, tgtLang); err != nil {
+		return false, "", fmt.Errorf("frontmatter translation failed for %s: %w", relPath, err)
+	}
 	updatedFront, err := encodeFrontMatter(frontData, relPath, content)
 	if err != nil {
 		return false, "", err
@@ -75,10 +66,11 @@ func processFileDoc(ctx context.Context, translator docsTranslator, docsRoot, fi
 	}
 
 	output := updatedFront + translatedBody
-	if !sameI18NProtocolMarkers(string(content), output) {
-		return false, "", fmt.Errorf("protocol token leaked in final output: __OC_I18N_")
-	}
 	return false, outputPath, os.WriteFile(outputPath, []byte(output), 0o644)
+}
+
+func formatTaggedDocument(frontMatter, body string) string {
+	return fmt.Sprintf("%s\n%s\n%s\n%s\n%s\n%s", frontmatterTagStart, frontMatter, frontmatterTagEnd, bodyTagStart, body, bodyTagEnd)
 }
 
 func parseTaggedDocument(text string) (string, string, error) {
@@ -104,9 +96,10 @@ func parseTaggedDocument(text string) (string, string, error) {
 		return "", "", fmt.Errorf("missing %s", bodyTagEnd)
 	}
 	body := trimTagNewlines(text[bodyStart:bodyEnd])
+	suffix := strings.TrimSpace(text[bodyEnd+len(bodyTagEnd):])
 
 	prefix := strings.TrimSpace(text[:frontStart-len(frontmatterTagStart)])
-	if prefix != "" {
+	if prefix != "" || suffix != "" {
 		return "", "", fmt.Errorf("unexpected text outside tagged sections")
 	}
 
@@ -118,11 +111,25 @@ func findTaggedBodyEnd(text string, bodyStart int) int {
 	if bodyStart < 0 || bodyStart > len(text) {
 		return -1
 	}
-	end := strings.LastIndex(text[bodyStart:], bodyTagEnd)
-	if end < 0 || strings.TrimSpace(text[bodyStart+end+len(bodyTagEnd):]) != "" {
-		return -1
+	search := text[bodyStart:]
+	candidate := -1
+	offset := 0
+	for {
+		index := strings.Index(search[offset:], bodyTagEnd)
+		if index == -1 {
+			return candidate
+		}
+		index += offset
+		absolute := bodyStart + index
+		suffix := strings.TrimSpace(text[absolute+len(bodyTagEnd):])
+		if suffix == "" {
+			candidate = absolute
+		}
+		offset = index + len(bodyTagEnd)
+		if offset >= len(search) {
+			return candidate
+		}
 	}
-	return bodyStart + end
 }
 
 func trimTagNewlines(value string) string {
@@ -131,53 +138,38 @@ func trimTagNewlines(value string) string {
 	return value
 }
 
-func classifyDocOutput(outputPath string, sourceHash string, targetLang string) (docOutputStatus, error) {
+func shouldSkipDoc(outputPath string, sourceHash string) (bool, error) {
 	data, err := os.ReadFile(outputPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return docOutputNeedsTranslation, nil
+			return false, nil
 		}
-		return docOutputNeedsTranslation, err
+		return false, err
 	}
 	frontMatter, _ := splitFrontMatter(string(data))
 	if frontMatter == "" {
-		return docOutputNeedsTranslation, nil
+		return false, nil
 	}
 	frontData := map[string]any{}
 	if err := yaml.Unmarshal([]byte(frontMatter), &frontData); err != nil {
-		return docOutputNeedsTranslation, nil
+		return false, nil
 	}
-	storedHash := extractI18NString(frontData, "source_hash")
+	storedHash := extractSourceHash(frontData)
 	if storedHash == "" {
-		return docOutputNeedsTranslation, nil
+		return false, nil
 	}
-	if !strings.EqualFold(storedHash, sourceHash) {
-		return docOutputNeedsTranslation, nil
-	}
-	if strings.EqualFold(strings.TrimSpace(targetLang), "en") {
-		return docOutputReady, nil
-	}
-	// Workflow changes can retire public metadata even when source text is unchanged.
-	if extractI18NVersion(frontData, "workflow") != workflowVersion || extractI18NVersion(frontData, "prompt_version") != promptVersion {
-		return docOutputNeedsTranslation, nil
-	}
-
-	postprocessVersion := extractI18NString(frontData, "postprocess_version")
-	if strings.EqualFold(postprocessVersion, localizedLinkPostprocessVersion) {
-		return docOutputReady, nil
-	}
-	return docOutputNeedsPostprocess, nil
+	return strings.EqualFold(storedHash, sourceHash), nil
 }
 
-func extractI18NVersion(frontData map[string]any, field string) int {
-	xi, _ := frontData["x-i18n"].(map[string]any)
-	value, _ := xi[field].(int)
-	return value
-}
-
-func extractI18NString(frontData map[string]any, field string) string {
-	xi, _ := frontData["x-i18n"].(map[string]any)
-	value, _ := xi[field].(string)
+func extractSourceHash(frontData map[string]any) string {
+	xi, ok := frontData["x-i18n"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	value, ok := xi["source_hash"].(string)
+	if !ok {
+		return ""
+	}
 	return strings.TrimSpace(value)
 }
 

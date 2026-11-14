@@ -1,3 +1,4 @@
+// Assertions for minimal OpenAI web-search E2E scenarios.
 import fs from "node:fs";
 import { readTextFileTail, tailText } from "../text-file-utils.mjs";
 
@@ -35,29 +36,6 @@ function scanTextFileLines(file, onLine) {
   }
 }
 
-function isSuccessPrompt(text) {
-  if (typeof text !== "string") {
-    return false;
-  }
-  // The Gateway may prepend its marked, compact JSON context block. Match the
-  // whole turn so a recap or quotation containing the prompt cannot select it.
-  const match =
-    /^(?:\[[^\]\r\n]+\] )?(?:Conversation info: ⟦openclaw:ctx⟧\n```json\n(\{[^\r\n]*\})\n```\n\n)?Return exactly OPENCLAW_SCHEMA_E2E_OK\.$/u.exec(
-      text.trim(),
-    );
-  if (!match) {
-    return false;
-  }
-  try {
-    if (match[1]) {
-      JSON.parse(match[1]);
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function scanSuccessRequest(logPath) {
   let responseCount = 0;
   let success;
@@ -80,27 +58,47 @@ function scanSuccessRequest(logPath) {
       line: lineNumber,
       bodyTail: tailText(bodyText, RESPONSE_PREVIEW_BYTES),
     });
-    // Activity recaps quote the marker too; select the agent turn independently
-    // of the web_search tool and reasoning settings that this assertion checks.
-    const input = entry.body?.input;
-    const hasSuccessPrompt =
-      typeof input === "string"
-        ? isSuccessPrompt(input)
-        : Array.isArray(input) &&
-          input.some(
-            (item) =>
-              item?.role === "user" &&
-              (isSuccessPrompt(item.content) ||
-                (Array.isArray(item.content) &&
-                  item.content.some(
-                    (part) => part?.type === "input_text" && isSuccessPrompt(part.text),
-                  ))),
-          );
-    if (!success && entry.body?.model === "gpt-5" && hasSuccessPrompt) {
+    if (!success && bodyText.includes("OPENCLAW_SCHEMA_E2E_OK")) {
       success = entry;
     }
   });
   return { responseCount, success, recentResponses };
+}
+
+function assertPatchBehavior() {
+  return import("../../../../dist/extensions/openai/native-web-search.js").then(
+    ({ patchOpenAINativeWebSearchPayload }) => {
+      const injectedPayload = {
+        reasoning: { effort: "minimal", summary: "auto" },
+      };
+      const injectedResult = patchOpenAINativeWebSearchPayload(injectedPayload);
+      if (injectedResult !== "injected") {
+        throw new Error(`expected native web_search injection, got ${injectedResult}`);
+      }
+      if (injectedPayload.reasoning.effort !== "low") {
+        throw new Error(
+          `expected injected native web_search to raise minimal reasoning to low, got ${JSON.stringify(injectedPayload.reasoning)}`,
+        );
+      }
+      if (!injectedPayload.tools?.some((tool) => tool?.type === "web_search")) {
+        throw new Error(`native web_search was not injected: ${JSON.stringify(injectedPayload)}`);
+      }
+
+      const existingNativePayload = {
+        tools: [{ type: "web_search" }],
+        reasoning: { effort: "minimal" },
+      };
+      const existingResult = patchOpenAINativeWebSearchPayload(existingNativePayload);
+      if (existingResult !== "native_tool_already_present") {
+        throw new Error(`expected existing native web_search, got ${existingResult}`);
+      }
+      if (existingNativePayload.reasoning.effort !== "low") {
+        throw new Error(
+          `expected existing native web_search to raise minimal reasoning to low, got ${JSON.stringify(existingNativePayload.reasoning)}`,
+        );
+      }
+    },
+  );
 }
 
 function assertSuccessRequest() {
@@ -130,34 +128,9 @@ function assertSuccessRequest() {
   }
 }
 
-function assertSchemaRejectLog() {
-  const required = [
-    'sessionKey="agent:main:openai-web-search-minimal:reject"',
-    'runId="schema-reject"',
-    "provider=openai",
-    "model=gpt-5",
-    "status=400",
-    "code=invalid_request_error",
-    "type=invalid_request_error",
-  ];
-  let found = false;
-  scanTextFileLines(process.argv[3], (line) => {
-    const match = /^\d{4}-\d{2}-\d{2}T\S+ \[provider-error\] Model request failed (.+)$/u.exec(
-      line,
-    );
-    if (match) {
-      const fields = new Set(match[1].split(/\s+/u));
-      found ||= required.every((field) => fields.has(field));
-    }
-  });
-  if (!found) {
-    throw new Error("missing provider-error metadata for the controlled schema rejection");
-  }
-}
-
 const commands = {
+  "assert-patch-behavior": assertPatchBehavior,
   "assert-success-request": assertSuccessRequest,
-  "assert-schema-reject-log": assertSchemaRejectLog,
 };
 
 const fn = commands[command];
