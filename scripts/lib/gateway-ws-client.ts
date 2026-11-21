@@ -1,19 +1,17 @@
 // Gateway Ws Client script supports OpenClaw repository automation.
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { rawDataToString } from "../../packages/gateway-client/src/websocket-data.ts";
-import { isRecord } from "../../packages/normalization-core/src/record-coerce.ts";
 
-type GatewayReqFrame = { type: "req"; id: string; method: string; params?: unknown };
-type GatewayResFrame = {
+export type GatewayReqFrame = { type: "req"; id: string; method: string; params?: unknown };
+export type GatewayResFrame = {
   type: "res";
   id: string;
   ok: boolean;
   payload?: unknown;
   error?: unknown;
 };
-type GatewayEventFrame = { type: "event"; event: string; seq?: number; payload?: unknown };
-type GatewayFrame =
+export type GatewayEventFrame = { type: "event"; event: string; seq?: number; payload?: unknown };
+export type GatewayFrame =
   | GatewayReqFrame
   | GatewayResFrame
   | GatewayEventFrame
@@ -39,21 +37,27 @@ export function resolveGatewayUrl(urlRaw: string): URL {
   return url;
 }
 
+function toText(data: WebSocket.RawData): string {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data).toString("utf8");
+  }
+  if (Array.isArray(data)) {
+    return Buffer.concat(data.map((chunk) => Buffer.from(chunk))).toString("utf8");
+  }
+  return Buffer.from(data as Buffer).toString("utf8");
+}
+
 export function createGatewayWsClient(params: {
   url: string;
-  origin?: string;
-  headers?: Record<string, string>;
   handshakeTimeoutMs?: number;
   openTimeoutMs?: number;
   openTimeoutMessage?: string;
   onEvent?: (evt: GatewayEventFrame) => void;
 }) {
-  const ws = new WebSocket(params.url, {
-    handshakeTimeout: params.handshakeTimeoutMs ?? 8000,
-    ...(params.origin ? { origin: params.origin } : {}),
-    ...(params.headers ? { headers: params.headers } : {}),
-  });
-  ws.binaryType = "nodebuffer";
+  const ws = new WebSocket(params.url, { handshakeTimeout: params.handshakeTimeoutMs ?? 8000 });
   const pending = new Map<
     string,
     {
@@ -71,7 +75,7 @@ export function createGatewayWsClient(params: {
     pending.clear();
   };
 
-  const requestOnce = (method: string, paramsObj?: unknown, timeoutMs = 12_000) =>
+  const request = (method: string, paramsObj?: unknown, timeoutMs = 12_000) =>
     new Promise<GatewayResFrame>((resolve, reject) => {
       if (ws.readyState !== WebSocket.OPEN) {
         reject(new Error(`gateway websocket is not open for ${method}`));
@@ -103,47 +107,6 @@ export function createGatewayWsClient(params: {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
-
-  const request = async (
-    method: string,
-    paramsObj?: unknown,
-    timeoutMs = 12_000,
-    options?: { retryStartup?: boolean },
-  ) => {
-    if (!options?.retryStartup) {
-      return requestOnce(method, paramsObj, timeoutMs);
-    }
-    // Only pre-admission startup refusals are safe to replay; never retry transport errors.
-    const deadline = performance.now() + Math.min(timeoutMs, 120_000);
-    for (;;) {
-      const remainingMs = deadline - performance.now();
-      if (remainingMs <= 0) {
-        throw new Error(`${method}: gateway startup did not settle within the request deadline`);
-      }
-      const response = await requestOnce(method, paramsObj, remainingMs);
-      const error = response.error;
-      if (
-        response.ok ||
-        !isRecord(error) ||
-        error.code !== "UNAVAILABLE" ||
-        error.retryable !== true ||
-        !isRecord(error.details) ||
-        error.details.reason !== "startup-sidecars" ||
-        typeof error.retryAfterMs !== "number" ||
-        !Number.isFinite(error.retryAfterMs) ||
-        error.retryAfterMs <= 0
-      ) {
-        return response;
-      }
-      const waitMs = Math.min(error.retryAfterMs, Math.max(0, deadline - performance.now()));
-      console.warn(
-        `STARTUP RETRY ${method}: startup-sidecars; retryAfterMs=${error.retryAfterMs}; waitMs=${waitMs}`,
-      );
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, waitMs);
-      });
-    }
-  };
 
   const waitOpen = () =>
     new Promise<void>((resolve, reject) => {
@@ -177,7 +140,7 @@ export function createGatewayWsClient(params: {
     });
 
   ws.on("message", (data) => {
-    const text = rawDataToString(data);
+    const text = toText(data);
     let frame: GatewayFrame | null;
     try {
       frame = JSON.parse(text) as GatewayFrame;

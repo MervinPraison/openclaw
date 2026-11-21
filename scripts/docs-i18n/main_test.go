@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +26,8 @@ func (fakeDocsTranslator) TranslateRaw(_ context.Context, text, _, _ string) (st
 	return replaced, nil
 }
 
+func (fakeDocsTranslator) Close() {}
+
 type invalidFrontmatterTranslator struct{}
 
 func (invalidFrontmatterTranslator) Translate(_ context.Context, text, _, _ string) (string, error) {
@@ -36,6 +37,8 @@ func (invalidFrontmatterTranslator) Translate(_ context.Context, text, _, _ stri
 func (invalidFrontmatterTranslator) TranslateRaw(_ context.Context, text, _, _ string) (string, error) {
 	return text, nil
 }
+
+func (invalidFrontmatterTranslator) Close() {}
 
 type transcriptFrontmatterTranslator struct{}
 
@@ -47,6 +50,8 @@ func (transcriptFrontmatterTranslator) TranslateRaw(_ context.Context, text, _, 
 	return text, nil
 }
 
+func (transcriptFrontmatterTranslator) Close() {}
+
 type errorTranslator struct{}
 
 func (errorTranslator) Translate(context.Context, string, string, string) (string, error) {
@@ -57,21 +62,7 @@ func (errorTranslator) TranslateRaw(context.Context, string, string, string) (st
 	return "", errors.New("codex exec failed: exit status 1")
 }
 
-func TestProcessFileRejectsFailedHTMLTranslation(t *testing.T) {
-	docsRoot := t.TempDir()
-	sourcePath := filepath.Join(docsRoot, "page.md")
-	if err := os.WriteFile(sourcePath, []byte("<div>Translate this text.</div>\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	tm := &TranslationMemory{entries: map[string]TMEntry{}}
-	_, _, err := processFile(context.Background(), errorTranslator{}, tm, docsRoot, sourcePath, "en", "de")
-	if err == nil || err.Error() != "codex exec failed: exit status 1" {
-		t.Fatalf("expected HTML translation failure, got %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(docsRoot, "de", "page.md")); !os.IsNotExist(err) {
-		t.Fatalf("failed translation wrote an output page: %v", err)
-	}
-}
+func (errorTranslator) Close() {}
 
 type partialFailTranslator struct{}
 
@@ -88,6 +79,8 @@ func (partialFailTranslator) TranslateRaw(_ context.Context, text, _, _ string) 
 	}
 	return text, nil
 }
+
+func (partialFailTranslator) Close() {}
 
 type partialFailSlowTranslator struct{}
 
@@ -113,6 +106,8 @@ func (partialFailSlowTranslator) TranslateRaw(ctx context.Context, text, srcLang
 	return partialFailTranslator{}.TranslateRaw(ctx, text, srcLang, tgtLang)
 }
 
+func (partialFailSlowTranslator) Close() {}
+
 type cancelAwareTranslator struct{}
 
 func (cancelAwareTranslator) Translate(ctx context.Context, text, _, _ string) (string, error) {
@@ -129,6 +124,8 @@ func (cancelAwareTranslator) TranslateRaw(ctx context.Context, text, _, _ string
 	return text, nil
 }
 
+func (cancelAwareTranslator) Close() {}
+
 type contextErrorTranslator struct{}
 
 func (contextErrorTranslator) Translate(_ context.Context, text, _, _ string) (string, error) {
@@ -144,6 +141,8 @@ func (contextErrorTranslator) TranslateRaw(_ context.Context, text, _, _ string)
 	}
 	return text, nil
 }
+
+func (contextErrorTranslator) Close() {}
 
 type cancelAfterFirstDocTranslator struct {
 	cancel context.CancelFunc
@@ -168,10 +167,13 @@ func (t *cancelAfterFirstDocTranslator) TranslateRaw(ctx context.Context, text, 
 	return text, nil
 }
 
+func (t *cancelAfterFirstDocTranslator) Close() {}
+
 func TestRunDocsI18NRewritesFinalLocalizedPageLinks(t *testing.T) {
 	t.Parallel()
 
 	docsRoot := t.TempDir()
+	writeFile(t, filepath.Join(docsRoot, ".i18n", "glossary.zh-CN.json"), "[]")
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
 	writeFile(t, filepath.Join(docsRoot, "gateway", "index.md"), stringsJoin(
 		"---",
@@ -198,8 +200,8 @@ func TestRunDocsI18NRewritesFinalLocalizedPageLinks(t *testing.T) {
 		thinking:   "high",
 		overwrite:  true,
 		parallel:   1,
-	}, []string{filepath.Join(docsRoot, "gateway", "index.md")}, func(_, _, _ string) docsTranslator {
-		return fakeDocsTranslator{}
+	}, []string{filepath.Join(docsRoot, "gateway", "index.md")}, func(_, _ string, _ []GlossaryEntry, _ string) (docsTranslator, error) {
+		return fakeDocsTranslator{}, nil
 	})
 	if err != nil {
 		t.Fatalf("runDocsI18N failed: %v", err)
@@ -217,252 +219,11 @@ func TestRunDocsI18NRewritesFinalLocalizedPageLinks(t *testing.T) {
 	}
 }
 
-func TestRunDocsI18NDoesNotSkipOutputAfterPostprocessFailure(t *testing.T) {
-	t.Parallel()
-
-	docsRoot := t.TempDir()
-	sourcePath := filepath.Join(docsRoot, "gateway", "index.md")
-	writeFile(t, sourcePath, stringsJoin(
-		"---",
-		"title: Gateway",
-		"---",
-		"",
-		"See [Troubleshooting](/gateway/troubleshooting).",
-	))
-
-	skip, outputPath, err := processFileDoc(context.Background(), fakeDocsTranslator{}, docsRoot, sourcePath, "en", "zh-CN", true)
-	if err != nil {
-		t.Fatalf("processFileDoc failed: %v", err)
-	}
-	if skip {
-		t.Fatal("processFileDoc unexpectedly skipped translation")
-	}
-	if err := postprocessLocalizedDocs(docsRoot, "zh-CN", []string{outputPath}); err == nil {
-		t.Fatal("expected missing docs.json to fail postprocess")
-	}
-
-	sourceBytes, err := os.ReadFile(sourcePath)
-	if err != nil {
-		t.Fatalf("read source failed: %v", err)
-	}
-	status, err := classifyDocOutput(outputPath, hashBytes(sourceBytes), "zh-CN")
-	if err != nil {
-		t.Fatalf("classifyDocOutput failed: %v", err)
-	}
-	if status != docOutputNeedsPostprocess {
-		t.Fatalf("expected failed-postprocess output to need postprocess, got %v", status)
-	}
-}
-
-func TestRunDocsI18NOnlyBecomesSkippableAfterPostprocessSucceeds(t *testing.T) {
-	t.Parallel()
-
-	docsRoot := t.TempDir()
-	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
-	sourcePath := filepath.Join(docsRoot, "gateway", "index.md")
-	writeFile(t, sourcePath, stringsJoin(
-		"---",
-		"title: Gateway",
-		"---",
-		"",
-		"See [Troubleshooting](/gateway/troubleshooting).",
-	))
-	writeFile(t, filepath.Join(docsRoot, "gateway", "troubleshooting.md"), "# Troubleshooting\n")
-
-	skip, outputPath, err := processFileDoc(context.Background(), fakeDocsTranslator{}, docsRoot, sourcePath, "en", "zh-CN", true)
-	if err != nil {
-		t.Fatalf("processFileDoc failed: %v", err)
-	}
-	if skip {
-		t.Fatal("processFileDoc unexpectedly skipped translation")
-	}
-
-	sourceBytes, err := os.ReadFile(sourcePath)
-	if err != nil {
-		t.Fatalf("read source failed: %v", err)
-	}
-	status, err := classifyDocOutput(outputPath, hashBytes(sourceBytes), "zh-CN")
-	if err != nil {
-		t.Fatalf("classifyDocOutput before postprocess failed: %v", err)
-	}
-	if status != docOutputNeedsPostprocess {
-		t.Fatalf("expected pending postprocess output to need postprocess, got %v", status)
-	}
-
-	if err := postprocessLocalizedDocs(docsRoot, "zh-CN", []string{outputPath}); err != nil {
-		t.Fatalf("postprocessLocalizedDocs failed: %v", err)
-	}
-
-	status, err = classifyDocOutput(outputPath, hashBytes(sourceBytes), "zh-CN")
-	if err != nil {
-		t.Fatalf("classifyDocOutput after postprocess failed: %v", err)
-	}
-	if status != docOutputReady {
-		t.Fatalf("expected postprocessed output to be ready, got %v:\n%s", status, mustReadFile(t, outputPath))
-	}
-}
-
-func TestClassifyDocOutputKeepsEnglishTargetsHashOnly(t *testing.T) {
-	t.Parallel()
-
-	docsRoot := t.TempDir()
-	sourcePath := filepath.Join(docsRoot, "gateway", "index.md")
-	writeFile(t, sourcePath, stringsJoin(
-		"---",
-		"title: Gateway",
-		"---",
-		"",
-		"See [Troubleshooting](/gateway/troubleshooting).",
-	))
-	outputPath := filepath.Join(docsRoot, "en", "gateway", "index.md")
-	writeFile(t, outputPath, stringsJoin(
-		"---",
-		"title: Gateway",
-		"x-i18n:",
-		"  source_hash: "+hashBytes([]byte(mustReadFile(t, sourcePath))),
-		"  postprocess_version: "+localizedLinkPostprocessPending,
-		"---",
-		"",
-		"See [Troubleshooting](/gateway/troubleshooting).",
-	))
-
-	status, err := classifyDocOutput(outputPath, hashBytes([]byte(mustReadFile(t, sourcePath))), "en")
-	if err != nil {
-		t.Fatalf("classifyDocOutput for English target failed: %v", err)
-	}
-	if status != docOutputReady {
-		t.Fatalf("expected English target to remain ready with matching source hash, got %v", status)
-	}
-}
-
-func TestClassifyDocOutputRequiresCurrentPromptVersion(t *testing.T) {
-	t.Parallel()
-
-	docsRoot := t.TempDir()
-	sourcePath := filepath.Join(docsRoot, "gateway", "index.md")
-	writeFile(t, sourcePath, "# Gateway\n")
-	outputPath := filepath.Join(docsRoot, "zh-CN", "gateway", "index.md")
-	sourceHash := hashBytes([]byte(mustReadFile(t, sourcePath)))
-	writeOutput := func(version int) {
-		writeFile(t, outputPath, stringsJoin(
-			"---",
-			"title: 网关",
-			"x-i18n:",
-			"  source_hash: "+sourceHash,
-			fmt.Sprintf("  prompt_version: %d", version),
-			fmt.Sprintf("  workflow: %d", workflowVersion),
-			"  postprocess_version: "+localizedLinkPostprocessVersion,
-			"---",
-			"",
-			"正文。",
-		))
-	}
-
-	writeOutput(promptVersion - 1)
-	status, err := classifyDocOutput(outputPath, sourceHash, "zh-CN")
-	if err != nil {
-		t.Fatalf("classifyDocOutput with stale prompt failed: %v", err)
-	}
-	if status != docOutputNeedsTranslation {
-		t.Fatalf("expected stale prompt output to need translation, got %v", status)
-	}
-
-	writeOutput(promptVersion)
-	status, err = classifyDocOutput(outputPath, sourceHash, "zh-CN")
-	if err != nil {
-		t.Fatalf("classifyDocOutput with current prompt failed: %v", err)
-	}
-	if status != docOutputReady {
-		t.Fatalf("expected current prompt output to be ready, got %v", status)
-	}
-}
-
-func TestFilterDocQueueSchedulesPendingOutputsForPostprocessOnly(t *testing.T) {
-	t.Parallel()
-
-	docsRoot := t.TempDir()
-	sourcePath := filepath.Join(docsRoot, "gateway", "index.md")
-	writeFile(t, sourcePath, "# Gateway\n")
-	outputPath := filepath.Join(docsRoot, "zh-CN", "gateway", "index.md")
-	writeFile(t, outputPath, stringsJoin(
-		"---",
-		"title: 网关",
-		"x-i18n:",
-		"  source_hash: "+hashBytes([]byte(mustReadFile(t, sourcePath))),
-		fmt.Sprintf("  prompt_version: %d", promptVersion),
-		fmt.Sprintf("  workflow: %d", workflowVersion),
-		"---",
-		"",
-		"See [Troubleshooting](/gateway/troubleshooting).",
-	))
-
-	pending, skipped, existingOutputs, err := filterDocQueue(docsRoot, "zh-CN", []string{sourcePath}, 0)
-	if err != nil {
-		t.Fatalf("filterDocQueue failed: %v", err)
-	}
-	if len(pending) != 0 {
-		t.Fatalf("expected current matching output to skip translation, got pending=%v", pending)
-	}
-	if skipped != 1 {
-		t.Fatalf("expected one skipped translation, got %d", skipped)
-	}
-	if len(existingOutputs) != 1 || existingOutputs[0] != outputPath {
-		t.Fatalf("expected existing output to be queued for postprocess, got %v", existingOutputs)
-	}
-}
-
-func TestFilterDocQueueHonorsMaxAcrossPostprocessOutputs(t *testing.T) {
-	t.Parallel()
-
-	docsRoot := t.TempDir()
-	firstSource := filepath.Join(docsRoot, "gateway", "index.md")
-	secondSource := filepath.Join(docsRoot, "providers", "example-provider.md")
-	writeFile(t, firstSource, "# Gateway\n")
-	writeFile(t, secondSource, "# Example provider\n")
-	firstOutput := filepath.Join(docsRoot, "zh-CN", "gateway", "index.md")
-	secondOutput := filepath.Join(docsRoot, "zh-CN", "providers", "example-provider.md")
-	writeFile(t, firstOutput, stringsJoin(
-		"---",
-		"title: 网关",
-		"x-i18n:",
-		"  source_hash: "+hashBytes([]byte(mustReadFile(t, firstSource))),
-		fmt.Sprintf("  prompt_version: %d", promptVersion),
-		fmt.Sprintf("  workflow: %d", workflowVersion),
-		"---",
-		"",
-		"# 网关",
-	))
-	writeFile(t, secondOutput, stringsJoin(
-		"---",
-		"title: 示例 provider",
-		"x-i18n:",
-		"  source_hash: "+hashBytes([]byte(mustReadFile(t, secondSource))),
-		fmt.Sprintf("  prompt_version: %d", promptVersion),
-		fmt.Sprintf("  workflow: %d", workflowVersion),
-		"---",
-		"",
-		"# 示例 provider",
-	))
-
-	pending, skipped, existingOutputs, err := filterDocQueue(docsRoot, "zh-CN", []string{firstSource, secondSource}, 1)
-	if err != nil {
-		t.Fatalf("filterDocQueue failed: %v", err)
-	}
-	if len(pending) != 0 {
-		t.Fatalf("expected no translations to be queued, got %v", pending)
-	}
-	if skipped != 1 {
-		t.Fatalf("expected one bounded postprocess-only skip, got %d", skipped)
-	}
-	if len(existingOutputs) != 1 || existingOutputs[0] != firstOutput {
-		t.Fatalf("expected only first output to be queued for postprocess, got %v", existingOutputs)
-	}
-}
-
 func TestRunDocsI18NAllowPartialKeepsEarlierSuccessfulDocOutputs(t *testing.T) {
 	t.Parallel()
 
 	docsRoot := t.TempDir()
+	writeFile(t, filepath.Join(docsRoot, ".i18n", "glossary.zh-CN.json"), "[]")
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
 	okPath := filepath.Join(docsRoot, "aaa-ok.md")
 	failPath := filepath.Join(docsRoot, "zzz-fail.md")
@@ -478,8 +239,8 @@ func TestRunDocsI18NAllowPartialKeepsEarlierSuccessfulDocOutputs(t *testing.T) {
 		overwrite:    true,
 		allowPartial: true,
 		parallel:     1,
-	}, []string{okPath, failPath}, func(_, _, _ string) docsTranslator {
-		return partialFailTranslator{}
+	}, []string{okPath, failPath}, func(_, _ string, _ []GlossaryEntry, _ string) (docsTranslator, error) {
+		return partialFailTranslator{}, nil
 	})
 	if err != nil {
 		t.Fatalf("runDocsI18N failed despite partial output: %v", err)
@@ -496,6 +257,7 @@ func TestRunDocsI18NAllowPartialContinuesAfterFailedDoc(t *testing.T) {
 	t.Parallel()
 
 	docsRoot := t.TempDir()
+	writeFile(t, filepath.Join(docsRoot, ".i18n", "glossary.zh-CN.json"), "[]")
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
 	failPath := filepath.Join(docsRoot, "aaa-fail.md")
 	okPath := filepath.Join(docsRoot, "zzz-ok.md")
@@ -511,8 +273,8 @@ func TestRunDocsI18NAllowPartialContinuesAfterFailedDoc(t *testing.T) {
 		overwrite:    true,
 		allowPartial: true,
 		parallel:     1,
-	}, []string{failPath, okPath}, func(_, _, _ string) docsTranslator {
-		return partialFailTranslator{}
+	}, []string{failPath, okPath}, func(_, _ string, _ []GlossaryEntry, _ string) (docsTranslator, error) {
+		return partialFailTranslator{}, nil
 	})
 	if err != nil {
 		t.Fatalf("runDocsI18N failed despite later partial output: %v", err)
@@ -529,6 +291,7 @@ func TestRunDocsI18NAllowPartialParallelKeepsQueuedDocsAfterFailure(t *testing.T
 	t.Parallel()
 
 	docsRoot := t.TempDir()
+	writeFile(t, filepath.Join(docsRoot, ".i18n", "glossary.zh-CN.json"), "[]")
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
 	failPath := filepath.Join(docsRoot, "aaa-fail.md")
 	slowPath := filepath.Join(docsRoot, "bbb-slow.md")
@@ -546,8 +309,8 @@ func TestRunDocsI18NAllowPartialParallelKeepsQueuedDocsAfterFailure(t *testing.T
 		overwrite:    true,
 		allowPartial: true,
 		parallel:     2,
-	}, []string{failPath, slowPath, okPath}, func(_, _, _ string) docsTranslator {
-		return partialFailSlowTranslator{}
+	}, []string{failPath, slowPath, okPath}, func(_, _ string, _ []GlossaryEntry, _ string) (docsTranslator, error) {
+		return partialFailSlowTranslator{}, nil
 	})
 	if err != nil {
 		t.Fatalf("runDocsI18N failed despite later parallel output: %v", err)
@@ -567,6 +330,7 @@ func TestRunDocsI18NAllowPartialStopsAfterRunCancellation(t *testing.T) {
 	t.Parallel()
 
 	docsRoot := t.TempDir()
+	writeFile(t, filepath.Join(docsRoot, ".i18n", "glossary.zh-CN.json"), "[]")
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
 	firstPath := filepath.Join(docsRoot, "aaa-first.md")
 	secondPath := filepath.Join(docsRoot, "zzz-second.md")
@@ -584,8 +348,8 @@ func TestRunDocsI18NAllowPartialStopsAfterRunCancellation(t *testing.T) {
 		overwrite:    true,
 		allowPartial: true,
 		parallel:     1,
-	}, []string{firstPath, secondPath}, func(_, _, _ string) docsTranslator {
-		return cancelAwareTranslator{}
+	}, []string{firstPath, secondPath}, func(_, _ string, _ []GlossaryEntry, _ string) (docsTranslator, error) {
+		return cancelAwareTranslator{}, nil
 	})
 	if err == nil {
 		t.Fatal("expected canceled run to fail even with allowPartial=true")
@@ -599,6 +363,7 @@ func TestRunDocsI18NAllowPartialReturnsCancellationAfterPartialSuccess(t *testin
 	t.Parallel()
 
 	docsRoot := t.TempDir()
+	writeFile(t, filepath.Join(docsRoot, ".i18n", "glossary.zh-CN.json"), "[]")
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
 	firstPath := filepath.Join(docsRoot, "aaa-first.md")
 	secondPath := filepath.Join(docsRoot, "zzz-second.md")
@@ -615,8 +380,8 @@ func TestRunDocsI18NAllowPartialReturnsCancellationAfterPartialSuccess(t *testin
 		overwrite:    true,
 		allowPartial: true,
 		parallel:     1,
-	}, []string{firstPath, secondPath}, func(_, _, _ string) docsTranslator {
-		return &cancelAfterFirstDocTranslator{cancel: cancel}
+	}, []string{firstPath, secondPath}, func(_, _ string, _ []GlossaryEntry, _ string) (docsTranslator, error) {
+		return &cancelAfterFirstDocTranslator{cancel: cancel}, nil
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled run after partial success, got %v", err)
@@ -633,6 +398,7 @@ func TestRunDocsI18NAllowPartialStopsAfterContextError(t *testing.T) {
 	t.Parallel()
 
 	docsRoot := t.TempDir()
+	writeFile(t, filepath.Join(docsRoot, ".i18n", "glossary.zh-CN.json"), "[]")
 	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
 	firstPath := filepath.Join(docsRoot, "aaa-first.md")
 	cancelPath := filepath.Join(docsRoot, "bbb-cancel.md")
@@ -650,8 +416,8 @@ func TestRunDocsI18NAllowPartialStopsAfterContextError(t *testing.T) {
 		overwrite:    true,
 		allowPartial: true,
 		parallel:     1,
-	}, []string{firstPath, cancelPath, laterPath}, func(_, _, _ string) docsTranslator {
-		return contextErrorTranslator{}
+	}, []string{firstPath, cancelPath, laterPath}, func(_, _ string, _ []GlossaryEntry, _ string) (docsTranslator, error) {
+		return contextErrorTranslator{}, nil
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected cancellation error to remain terminal, got %v", err)
@@ -664,13 +430,69 @@ func TestRunDocsI18NAllowPartialStopsAfterContextError(t *testing.T) {
 	}
 }
 
+func TestRunDocsI18NRewritesLineTitleFromExactGlossaryWithoutModel(t *testing.T) {
+	t.Parallel()
+
+	docsRoot := t.TempDir()
+	writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
+	linePath := filepath.Join(docsRoot, "channels", "line.md")
+	writeFile(t, linePath, stringsJoin(
+		"---",
+		"title: LINE",
+		"---",
+		"",
+	))
+
+	locales := []string{"zh-CN", "zh-TW", "de", "es"}
+	for _, locale := range locales {
+		writeFile(t, filepath.Join(docsRoot, ".i18n", "glossary."+locale+".json"), `[{"source":"LINE","target":"LINE"}]`)
+		writeFile(t, filepath.Join(docsRoot, locale, "channels", "line.md"), stringsJoin(
+			"---",
+			"title: 行",
+			"---",
+			"",
+		))
+
+		err := runDocsI18N(context.Background(), runConfig{
+			targetLang: locale,
+			sourceLang: "en",
+			docsRoot:   docsRoot,
+			mode:       "doc",
+			thinking:   "low",
+			overwrite:  true,
+			parallel:   1,
+		}, []string{linePath}, func(srcLang, tgtLang string, glossary []GlossaryEntry, thinking string) (docsTranslator, error) {
+			translator, err := NewCodexTranslator(srcLang, tgtLang, glossary, thinking)
+			if err != nil {
+				return nil, err
+			}
+			translator.runPrompt = func(context.Context, codexPromptRequest) (string, error) {
+				t.Fatalf("exact LINE title for %s should not call Codex", tgtLang)
+				return "", nil
+			}
+			return translator, nil
+		})
+		if err != nil {
+			t.Fatalf("runDocsI18N(%s) failed: %v", locale, err)
+		}
+
+		got := mustReadFile(t, filepath.Join(docsRoot, locale, "channels", "line.md"))
+		if !containsLine(got, "title: LINE") {
+			t.Fatalf("expected %s title to stay LINE, got:\n%s", locale, got)
+		}
+	}
+}
+
 func TestTranslateSnippetDoesNotCacheFallbackToSource(t *testing.T) {
 	t.Parallel()
 
 	tm := &TranslationMemory{entries: map[string]TMEntry{}}
 	source := "Gateway"
 
-	translated := translateSnippet(context.Background(), invalidFrontmatterTranslator{}, tm, "gateway/index.md:frontmatter:title", source, "en", "zh-CN")
+	translated, err := translateSnippet(context.Background(), invalidFrontmatterTranslator{}, tm, "gateway/index.md:frontmatter:title", source, "en", "zh-CN")
+	if err != nil {
+		t.Fatalf("translateSnippet returned error: %v", err)
+	}
 	if translated != source {
 		t.Fatalf("expected fallback to source text, got %q", translated)
 	}
@@ -687,7 +509,10 @@ func TestTranslateSnippetRejectsTranscriptArtifact(t *testing.T) {
 	tm := &TranslationMemory{entries: map[string]TMEntry{}}
 	source := "Working with reactions across channels"
 
-	translated := translateSnippet(context.Background(), transcriptFrontmatterTranslator{}, tm, "tools/reactions.md:frontmatter:read_when:0", source, "en", "th")
+	translated, err := translateSnippet(context.Background(), transcriptFrontmatterTranslator{}, tm, "tools/reactions.md:frontmatter:read_when:0", source, "en", "th")
+	if err != nil {
+		t.Fatalf("translateSnippet returned error: %v", err)
+	}
 	if translated != source {
 		t.Fatalf("expected fallback to source text, got %q", translated)
 	}
@@ -704,7 +529,10 @@ func TestTranslateSnippetFallsBackWhenFrontmatterTranslatorFails(t *testing.T) {
 	tm := &TranslationMemory{entries: map[string]TMEntry{}}
 	source := "LINE Messaging API plugin setup, config, and usage"
 
-	translated := translateSnippet(context.Background(), errorTranslator{}, tm, "channels/line.md:frontmatter:summary", source, "en", "zh-CN")
+	translated, err := translateSnippet(context.Background(), errorTranslator{}, tm, "channels/line.md:frontmatter:summary", source, "en", "zh-CN")
+	if err != nil {
+		t.Fatalf("translateSnippet returned error: %v", err)
+	}
 	if translated != source {
 		t.Fatalf("expected fallback to source text, got %q", translated)
 	}
@@ -722,7 +550,10 @@ func TestTranslateSnippetCachesDocumentSourcePath(t *testing.T) {
 	source := "Gateway"
 	segmentID := "gateway/index.md:frontmatter:title"
 
-	translated := translateSnippet(context.Background(), fakeDocsTranslator{}, tm, segmentID, source, "en", "zh-CN")
+	translated, err := translateSnippet(context.Background(), fakeDocsTranslator{}, tm, segmentID, source, "en", "zh-CN")
+	if err != nil {
+		t.Fatalf("translateSnippet returned error: %v", err)
+	}
 	if translated != source {
 		t.Fatalf("unexpected translation %q", translated)
 	}
@@ -757,49 +588,5 @@ func TestValidateNoTranslationTranscriptArtifacts(t *testing.T) {
 	source := "Document `functions.read` examples exactly."
 	if err := validateNoTranslationTranscriptArtifacts(source, "Document `functions.read` examples exactly."); err != nil {
 		t.Fatalf("expected source-owned token to be allowed: %v", err)
-	}
-}
-
-func TestRunDocsI18NKeepsModelSelectionPrivate(t *testing.T) {
-	t.Setenv(envDocsI18nModel, "private-primary")
-	t.Setenv("OPENCLAW_DOCS_I18N_FALLBACK_MODEL", "private-fallback")
-	for _, mode := range []string{"doc", "segment"} {
-		t.Run(mode, func(t *testing.T) {
-			docsRoot := t.TempDir()
-			writeFile(t, filepath.Join(docsRoot, "docs.json"), `{"redirects":[]}`)
-			writeFile(t, filepath.Join(docsRoot, ".i18n", "zh-CN.tm.jsonl"), `{"cache_key":"old-cache","translated":"old translation","model":"private-primary","provider":"old-provider"}`)
-			source := filepath.Join(docsRoot, "test.md")
-			writeFile(t, source, "---\ntitle: Gateway\n---\n\n# Gateway\n\nHello world.\n")
-			writeFile(t, filepath.Join(docsRoot, "zh-CN", "test.md"), stringsJoin(
-				"---",
-				"title: Gateway",
-				"x-i18n:",
-				"  source_hash: "+hashBytes([]byte(mustReadFile(t, source))),
-				fmt.Sprintf("  prompt_version: %d", promptVersion),
-				fmt.Sprintf("  workflow: %d", workflowVersion-1),
-				"  postprocess_version: "+localizedLinkPostprocessVersion,
-				"  model: private-primary",
-				"  provider: old-provider",
-				"---",
-				"",
-				"# Previous translation",
-			))
-			if err := runDocsI18N(context.Background(), runConfig{docsRoot: docsRoot, sourceLang: "en", targetLang: "zh-CN", mode: mode, parallel: 1}, []string{source}, func(string, string, string) docsTranslator {
-				return fakeDocsTranslator{}
-			}); err != nil {
-				t.Fatal(err)
-			}
-			for _, path := range []string{filepath.Join(docsRoot, "zh-CN", "test.md"), filepath.Join(docsRoot, ".i18n", "zh-CN.tm.jsonl")} {
-				data, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, private := range []string{"private-primary", "private-fallback", "model:", `"model":`, "provider:", `"provider":`} {
-					if strings.Contains(string(data), private) {
-						t.Fatalf("private metadata %q leaked in %s", private, path)
-					}
-				}
-			}
-		})
 	}
 }

@@ -1,3 +1,4 @@
+// Test Device Pair Telegram script supports OpenClaw repository automation.
 import { pathToFileURL } from "node:url";
 import { getRuntimeConfig } from "../../src/config/config.js";
 import { matchPluginCommand, executePluginCommand } from "../../src/plugins/commands.js";
@@ -12,26 +13,34 @@ type SendMessageTelegram = (
   },
 ) => Promise<{ chatId?: string; messageId?: string }>;
 
-type DevicePairTelegramDeps = ReturnType<typeof createDefaultDeps>;
+type DevicePairTelegramDeps = {
+  executePluginCommand: typeof executePluginCommand;
+  getRuntimeConfig: typeof getRuntimeConfig;
+  loadOpenClawPlugins: typeof loadOpenClawPlugins;
+  matchPluginCommand: typeof matchPluginCommand;
+  sendMessageTelegram: SendMessageTelegram;
+};
+
+type DevicePairTelegramResult = {
+  accountId?: string;
+  chatId: string;
+  messageId?: string;
+  sent: boolean;
+};
 
 class UsageError extends Error {
   readonly exitCode = 1;
-}
-
-class CliArgumentError extends UsageError {}
-
-const BOOLEAN_FLAGS = new Set(["--help", "-h"]);
-const VALUE_FLAGS = new Set(["--account", "-a", "--chat", "-c"]);
-
-function isMissingOptionValue(value: string | undefined): boolean {
-  return !value || BOOLEAN_FLAGS.has(value) || VALUE_FLAGS.has(value) || value.startsWith("--");
 }
 
 function writeStdoutLine(...parts: string[]): void {
   process.stdout.write(`${parts.join(" ")}\n`);
 }
 
-function readArg(args: readonly string[], flag: string, short?: string): string | undefined {
+function writeStderrLine(message: string): void {
+  process.stderr.write(`${message}\n`);
+}
+
+function readArg(args: string[], flag: string, short?: string): string | undefined {
   const idx = args.indexOf(flag);
   if (idx !== -1 && idx + 1 < args.length) {
     return args[idx + 1];
@@ -48,39 +57,7 @@ function readArg(args: readonly string[], flag: string, short?: string): string 
 function usage(): string {
   return [
     "Usage: bun scripts/dev/test-device-pair-telegram.ts --chat <telegram-chat-id> [--account <accountId>]",
-    "",
-    "Options:",
-    "  --chat, -c <id>       Telegram chat id",
-    "  --account, -a <id>    Telegram account id",
-    "  -h, --help            Show this help",
   ].join("\n");
-}
-
-function validateArgs(args: readonly string[]): void {
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index] ?? "";
-    if (BOOLEAN_FLAGS.has(arg)) {
-      continue;
-    }
-    if (VALUE_FLAGS.has(arg)) {
-      const value = args[index + 1];
-      if (isMissingOptionValue(value)) {
-        throw new CliArgumentError(`${arg} requires a value`);
-      }
-      index += 1;
-      continue;
-    }
-    throw new CliArgumentError(`Unknown argument: ${arg}`);
-  }
-}
-
-function parseDevicePairTelegramArgs(args: readonly string[]) {
-  validateArgs(args);
-  return {
-    accountId: readArg(args, "--account", "-a"),
-    chatId: readArg(args, "--chat", "-c"),
-    help: args.includes("--help") || args.includes("-h"),
-  };
 }
 
 async function loadTelegramRuntimeSendMessage(): Promise<SendMessageTelegram> {
@@ -92,13 +69,13 @@ async function loadTelegramRuntimeSendMessage(): Promise<SendMessageTelegram> {
   return runtime.sendMessageTelegram;
 }
 
-function createDefaultDeps() {
+function createDefaultDeps(): DevicePairTelegramDeps {
   return {
     executePluginCommand,
     getRuntimeConfig,
     loadOpenClawPlugins,
     matchPluginCommand,
-    sendMessageTelegram: async (...args: Parameters<SendMessageTelegram>) => {
+    sendMessageTelegram: async (...args) => {
       const sendMessageTelegram = await loadTelegramRuntimeSendMessage();
       return await sendMessageTelegram(...args);
     },
@@ -108,9 +85,10 @@ function createDefaultDeps() {
 async function runDevicePairTelegram(
   args = process.argv.slice(2),
   deps: DevicePairTelegramDeps = createDefaultDeps(),
-) {
-  const { accountId, chatId, help } = parseDevicePairTelegramArgs(args);
-  if (help || !chatId) {
+): Promise<DevicePairTelegramResult> {
+  const chatId = readArg(args, "--chat", "-c");
+  const accountId = readArg(args, "--account", "-a");
+  if (!chatId) {
     throw new UsageError(usage());
   }
 
@@ -155,12 +133,7 @@ async function runDevicePairTelegram(
 
 async function main(): Promise<void> {
   try {
-    const args = process.argv.slice(2);
-    if (args.includes("--help") || args.includes("-h")) {
-      writeStdoutLine(usage());
-      return;
-    }
-    const result = await runDevicePairTelegram(args);
+    const result = await runDevicePairTelegram();
     writeStdoutLine(
       "Sent split /pair messages to",
       result.chatId,
@@ -168,7 +141,7 @@ async function main(): Promise<void> {
       result.messageId ? `message=${result.messageId}` : "",
     );
   } catch (error) {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    writeStderrLine(error instanceof Error ? error.message : String(error));
     process.exitCode = error instanceof UsageError ? error.exitCode : 1;
   }
 }
@@ -177,4 +150,4 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   await main();
 }
 
-export { parseDevicePairTelegramArgs, runDevicePairTelegram };
+export { runDevicePairTelegram };

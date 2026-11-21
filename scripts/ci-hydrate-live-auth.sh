@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
-if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
-  exec /bin/bash "$0" "$@"
-fi
 set -euo pipefail
 
 profile_path="${1:-${RUNNER_TEMP:-/tmp}/openclaw-live.profile}"
@@ -32,79 +28,22 @@ write_secret_file() {
   chmod 600 "$destination"
 }
 
-activate_claude_oauth_access_token() {
-  local credentials="${OPENCLAW_CLAUDE_CREDENTIALS_JSON:-}"
-  local access_token="${ANTHROPIC_OAUTH_TOKEN:-${CLAUDE_CODE_OAUTH_TOKEN:-}}"
-  local expires_at now_ms candidate
-  local min_remaining_ms="$(( 90 * 60 * 1000 ))"
-  if [[ -n "$credentials" ]]; then
-    candidate="$(jq -r '.claudeAiOauth.accessToken // empty' <<<"$credentials" 2>/dev/null || true)"
-    expires_at="$(jq -r '.claudeAiOauth.expiresAt // 0' <<<"$credentials" 2>/dev/null || true)"
-    now_ms="$(( $(date +%s) * 1000 ))"
-
-    if [[ "$candidate" != sk-ant-oat* ]]; then
-      echo "::warning::Claude credentials JSON has no usable OAuth access token; keeping the configured Anthropic fallback." >&2
-    # Stable live shards can run for an hour, so never shadow the fallback with
-    # a token that could expire before setup, retries, and cleanup complete.
-    elif ! [[ "$expires_at" =~ ^[0-9]+$ ]] || (( expires_at <= now_ms + min_remaining_ms )); then
-      echo "::warning::Claude credentials JSON OAuth access token lacks 90 minutes of remaining life; keeping the configured Anthropic fallback." >&2
-    else
-      access_token="$candidate"
-    fi
-  fi
-
-  if [[ -z "$access_token" ]]; then
-    return
-  fi
-
-  echo "::add-mask::$access_token"
-  export ANTHROPIC_OAUTH_TOKEN="$access_token"
-  if [[ -n "${GITHUB_ENV:-}" ]]; then
-    printf 'ANTHROPIC_OAUTH_TOKEN=%s\n' "$access_token" >>"$GITHUB_ENV"
-  fi
-}
-
-activate_claude_oauth_access_token
-
 for env_key in \
-  ABLITERATION_API_KEY \
-  AZURE_SPEECH_KEY \
-  AZURE_SPEECH_REGION \
-  BASETEN_API_KEY \
-  OPENCLAW_LIVE_R2_ACCOUNT_ID \
-  OPENCLAW_LIVE_R2_BUCKET \
-  OPENCLAW_LIVE_R2_ACCESS_KEY_ID \
-  OPENCLAW_LIVE_R2_SECRET_ACCESS_KEY \
-  ELEVENLABS_API_KEY \
-  FEATHERLESS_API_KEY \
-  OPENCLAW_LIVE_GITHUB_COPILOT_TOKEN \
-  OPENCLAW_GOOGLE_MEET_LIVE_MEETING \
-  OPENCLAW_GOOGLE_MEET_CLIENT_ID \
-  OPENCLAW_GOOGLE_MEET_CLIENT_SECRET \
-  OPENCLAW_GOOGLE_MEET_REFRESH_TOKEN \
-  GRADIUM_API_KEY \
-  INWORLD_API_KEY \
-  MODEL_API_KEY \
-  VOLCENGINE_TTS_API_KEY \
   OPENAI_API_KEY \
   OPENAI_BASE_URL \
-  ANTHROPIC_OAUTH_TOKEN \
   ANTHROPIC_API_KEY \
   ANTHROPIC_API_KEY_OLD \
   ANTHROPIC_API_TOKEN \
   BYTEPLUS_API_KEY \
   CEREBRAS_API_KEY \
   DEEPINFRA_API_KEY \
-  DEEPSEEK_API_KEY \
   DASHSCOPE_API_KEY \
   GROQ_API_KEY \
-  KIE_API_KEY \
   KIMI_API_KEY \
   MODELSTUDIO_API_KEY \
   MOONSHOT_API_KEY \
   MISTRAL_API_KEY \
   MINIMAX_API_KEY \
-  NOVITA_API_KEY \
   OPENCODE_API_KEY \
   OPENCODE_ZEN_API_KEY \
   OPENCLAW_LIVE_BROWSER_CDP_URL \
@@ -116,7 +55,6 @@ for env_key in \
   GEMINI_API_KEY \
   GOOGLE_API_KEY \
   OPENROUTER_API_KEY \
-  PIXVERSE_API_KEY \
   QWEN_API_KEY \
   FAL_KEY \
   RUNWAY_API_KEY \
