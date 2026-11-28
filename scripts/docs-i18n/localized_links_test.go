@@ -41,8 +41,8 @@ func TestLocalizeBodyLinks(t *testing.T) {
 		},
 		{
 			name:  "images stay unchanged",
-			input: `![Config](/gateway/configuration)`,
-			want:  `![Config](/gateway/configuration)`,
+			input: `![Diagram](/images/diagram.svg)`,
+			want:  `![Diagram](/images/diagram.svg)`,
 		},
 		{
 			name:  "already localized stays unchanged",
@@ -139,19 +139,6 @@ func TestLocalizeBodyLinks(t *testing.T) {
 	}
 }
 
-func TestUnmaskMarkdownRestoresNestedPlaceholders(t *testing.T) {
-	placeholders := []string{"__OC_I18N_900000__", "__OC_I18N_900001__"}
-	mapping := map[string]string{
-		"__OC_I18N_900000__": "```ts\nconst value = true;\n```",
-		"__OC_I18N_900001__": "Before\n__OC_I18N_900000__\nAfter",
-	}
-	got := unmaskMarkdown("__OC_I18N_900001__", placeholders, mapping)
-	want := "Before\n```ts\nconst value = true;\n```\nAfter"
-	if got != want {
-		t.Fatalf("nested placeholders not fully restored\nwant: %q\ngot:  %q", want, got)
-	}
-}
-
 func setupDocsTree(t *testing.T) string {
 	t.Helper()
 
@@ -167,13 +154,13 @@ func setupDocsTree(t *testing.T) string {
 		"channels/troubleshooting.md":           "# Troubleshooting\n",
 		"gateway/configuration.md":              "# Config\n",
 		"gateway/sandboxing.md":                 "# Sandboxing\n",
-		"security/verification-method.md":       "---\npermalink: /security/formal-verification/\n---\n\n# Formal verification\n",
+		"security/formal-verification.md":       "---\npermalink: /security/formal-verification/\n---\n\n# Formal verification\n",
 		"help/faq.md":                           "# FAQ\n",
 		"zh-CN/index.md":                        "# Home\n",
 		"zh-CN/channels/troubleshooting.md":     "# Troubleshooting\n",
 		"zh-CN/gateway/configuration.md":        "# Config\n",
 		"zh-CN/gateway/sandboxing.md":           "# Sandboxing\n",
-		"zh-CN/security/verification-method.md": "---\npermalink: /security/formal-verification/\n---\n\n# Formal verification\n",
+		"zh-CN/security/formal-verification.md": "---\npermalink: /security/formal-verification/\n---\n\n# Formal verification\n",
 		"ja-JP/index.md":                        "# Home\n",
 	}
 

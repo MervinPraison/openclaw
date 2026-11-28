@@ -12,11 +12,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	localizedLinkPostprocessPending = "pending"
-	localizedLinkPostprocessVersion = "locale-links-v1"
-)
-
 func processFile(ctx context.Context, translator docsTranslator, tm *TranslationMemory, docsRoot, filePath, srcLang, tgtLang string) (bool, string, error) {
 	absPath, relPath, err := resolveDocsPath(docsRoot, filePath)
 	if err != nil {
@@ -36,14 +31,19 @@ func processFile(ctx context.Context, translator docsTranslator, tm *Translation
 		}
 	}
 
-	translateFrontMatter(ctx, translator, tm, frontData, relPath, srcLang, tgtLang)
+	if err := translateFrontMatter(ctx, translator, tm, frontData, relPath, srcLang, tgtLang); err != nil {
+		return false, "", err
+	}
 
 	body, err = translateHTMLBlocks(ctx, translator, body, srcLang, tgtLang)
 	if err != nil {
 		return false, "", err
 	}
 
-	segments := extractSegments(body, relPath)
+	segments, err := extractSegments(body, relPath)
+	if err != nil {
+		return false, "", err
+	}
 
 	namespace := cacheNamespace()
 	for i := range segments {
@@ -65,6 +65,8 @@ func processFile(ctx context.Context, translator docsTranslator, tm *Translation
 			TextHash:   seg.TextHash,
 			Text:       seg.Text,
 			Translated: translated,
+			Provider:   docsI18nProvider(),
+			Model:      docsI18nModel(),
 			SrcLang:    srcLang,
 			TgtLang:    tgtLang,
 			UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
@@ -92,6 +94,9 @@ func splitFrontMatter(content string) (string, string) {
 		return "", content
 	}
 	lines := strings.Split(content, "\n")
+	if len(lines) < 2 {
+		return "", content
+	}
 	endIndex := -1
 	for i := 1; i < len(lines); i++ {
 		if strings.TrimSpace(lines[i]) == "---" {
@@ -104,7 +109,9 @@ func splitFrontMatter(content string) (string, string) {
 	}
 	front := strings.Join(lines[1:endIndex], "\n")
 	body := strings.Join(lines[endIndex+1:], "\n")
-	body = strings.TrimPrefix(body, "\n")
+	if strings.HasPrefix(body, "\n") {
+		body = body[1:]
+	}
 	return front, body
 }
 
@@ -113,12 +120,12 @@ func encodeFrontMatter(frontData map[string]any, relPath string, source []byte) 
 		frontData = map[string]any{}
 	}
 	frontData["x-i18n"] = map[string]any{
-		"source_path":         relPath,
-		"source_hash":         hashBytes(source),
-		"workflow":            workflowVersion,
-		"prompt_version":      promptVersion,
-		"generated_at":        time.Now().UTC().Format(time.RFC3339),
-		"postprocess_version": localizedLinkPostprocessPending,
+		"source_path":  relPath,
+		"source_hash":  hashBytes(source),
+		"provider":     docsI18nProvider(),
+		"model":        docsI18nModel(),
+		"workflow":     workflowVersion,
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
 	}
 	encoded, err := yaml.Marshal(frontData)
 	if err != nil {
@@ -127,20 +134,35 @@ func encodeFrontMatter(frontData map[string]any, relPath string, source []byte) 
 	return fmt.Sprintf("---\n%s---\n\n", string(encoded)), nil
 }
 
-func translateFrontMatter(ctx context.Context, translator docsTranslator, tm *TranslationMemory, data map[string]any, relPath, srcLang, tgtLang string) {
-	for _, field := range []string{"summary", "title"} {
-		text, ok := data[field].(string)
-		if !ok {
-			continue
+func translateFrontMatter(ctx context.Context, translator docsTranslator, tm *TranslationMemory, data map[string]any, relPath, srcLang, tgtLang string) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if summary, ok := data["summary"].(string); ok {
+		if docsI18nVerboseLogs() {
+			log.Printf("docs-i18n: frontmatter start %s field=summary bytes=%d", relPath, len(summary))
+		}
+		translated, err := translateSnippet(ctx, translator, tm, relPath+":frontmatter:summary", summary, srcLang, tgtLang)
+		if err != nil {
+			return err
 		}
 		if docsI18nVerboseLogs() {
-			log.Printf("docs-i18n: frontmatter start %s field=%s bytes=%d", relPath, field, len(text))
+			log.Printf("docs-i18n: frontmatter done %s field=summary out_bytes=%d", relPath, len(translated))
 		}
-		translated := translateSnippet(ctx, translator, tm, relPath+":frontmatter:"+field, text, srcLang, tgtLang)
+		data["summary"] = translated
+	}
+	if title, ok := data["title"].(string); ok {
 		if docsI18nVerboseLogs() {
-			log.Printf("docs-i18n: frontmatter done %s field=%s out_bytes=%d", relPath, field, len(translated))
+			log.Printf("docs-i18n: frontmatter start %s field=title bytes=%d", relPath, len(title))
 		}
-		data[field] = translated
+		translated, err := translateSnippet(ctx, translator, tm, relPath+":frontmatter:title", title, srcLang, tgtLang)
+		if err != nil {
+			return err
+		}
+		if docsI18nVerboseLogs() {
+			log.Printf("docs-i18n: frontmatter done %s field=title out_bytes=%d", relPath, len(translated))
+		}
+		data["title"] = translated
 	}
 	if readWhen, ok := data["read_when"].([]any); ok {
 		translated := make([]any, 0, len(readWhen))
@@ -153,7 +175,10 @@ func translateFrontMatter(ctx context.Context, translator docsTranslator, tm *Tr
 			if docsI18nVerboseLogs() {
 				log.Printf("docs-i18n: frontmatter start %s field=read_when[%d] bytes=%d", relPath, idx, len(textValue))
 			}
-			value := translateSnippet(ctx, translator, tm, fmt.Sprintf("%s:frontmatter:read_when:%d", relPath, idx), textValue, srcLang, tgtLang)
+			value, err := translateSnippet(ctx, translator, tm, fmt.Sprintf("%s:frontmatter:read_when:%d", relPath, idx), textValue, srcLang, tgtLang)
+			if err != nil {
+				return err
+			}
 			if docsI18nVerboseLogs() {
 				log.Printf("docs-i18n: frontmatter done %s field=read_when[%d] out_bytes=%d", relPath, idx, len(value))
 			}
@@ -161,10 +186,14 @@ func translateFrontMatter(ctx context.Context, translator docsTranslator, tm *Tr
 		}
 		data["read_when"] = translated
 	}
+	return nil
 }
 
 func docsI18nVerboseLogs() bool {
 	value := strings.TrimSpace(os.Getenv("OPENCLAW_DOCS_I18N_VERBOSE_LOGS"))
+	if value == "" {
+		return false
+	}
 	switch strings.ToLower(value) {
 	case "1", "true", "yes", "on", "debug", "verbose":
 		return true
@@ -173,26 +202,31 @@ func docsI18nVerboseLogs() bool {
 	}
 }
 
-func translateSnippet(ctx context.Context, translator docsTranslator, tm *TranslationMemory, segmentID, textValue, srcLang, tgtLang string) string {
+func translateSnippet(ctx context.Context, translator docsTranslator, tm *TranslationMemory, segmentID, textValue, srcLang, tgtLang string) (string, error) {
 	if strings.TrimSpace(textValue) == "" {
-		return textValue
+		return textValue, nil
 	}
 	namespace := cacheNamespace()
 	textHash := hashText(textValue)
 	ck := cacheKey(namespace, srcLang, tgtLang, segmentID, textHash)
 	if entry, ok := tm.Get(ck); ok {
-		return entry.Translated
+		return entry.Translated, nil
 	}
 	translated, err := translator.Translate(ctx, textValue, srcLang, tgtLang)
 	if err != nil {
 		log.Printf("docs-i18n: frontmatter fallback %s reason=%v", segmentID, err)
-		return textValue
+		return textValue, nil
 	}
+	shouldCache := true
 	if validationErr := validateFrontmatterScalarTranslation(textValue, translated); validationErr != nil {
 		log.Printf("docs-i18n: frontmatter fallback %s reason=%v", segmentID, validationErr)
-		return textValue
+		translated = textValue
+		shouldCache = false
 	}
-	sourcePath, _, _ := strings.Cut(segmentID, ":frontmatter:")
+	sourcePath := segmentID
+	if path, _, ok := strings.Cut(segmentID, ":frontmatter:"); ok {
+		sourcePath = path
+	}
 	entry := TMEntry{
 		CacheKey:   ck,
 		SegmentID:  segmentID,
@@ -200,12 +234,16 @@ func translateSnippet(ctx context.Context, translator docsTranslator, tm *Transl
 		TextHash:   textHash,
 		Text:       textValue,
 		Translated: translated,
+		Provider:   docsI18nProvider(),
+		Model:      docsI18nModel(),
 		SrcLang:    srcLang,
 		TgtLang:    tgtLang,
 		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
 	}
-	tm.Put(entry)
-	return translated
+	if shouldCache {
+		tm.Put(entry)
+	}
+	return translated, nil
 }
 
 func validateFrontmatterScalarTranslation(source, translated string) error {

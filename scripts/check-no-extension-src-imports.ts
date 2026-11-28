@@ -1,16 +1,21 @@
+// Check No Extension Src Imports script supports OpenClaw repository automation.
 import fs from "node:fs";
 import path from "node:path";
 import { collectFilesSync, isCodeFile, relativeToCwd } from "./check-file-utils.js";
-import { classifyBundledExtensionSourcePath } from "./lib/extension-source-classifier.mts";
+import { classifyBundledExtensionSourcePath } from "./lib/extension-source-classifier.mjs";
 
 const FORBIDDEN_REPO_SRC_IMPORT = /["'](?:\.\.\/)+(?:src\/)[^"']+["']/;
 
-function main() {
-  const extensionsDir = path.join(process.cwd(), "extensions");
-  const files = collectFilesSync(extensionsDir, {
+function collectExtensionSourceFiles(rootDir: string): string[] {
+  return collectFilesSync(rootDir, {
     includeFile: (filePath) =>
       isCodeFile(filePath) && classifyBundledExtensionSourcePath(filePath).isProductionSource,
   });
+}
+
+function main() {
+  const extensionsDir = path.join(process.cwd(), "extensions");
+  const files = collectExtensionSourceFiles(extensionsDir);
   const offenders: string[] = [];
 
   for (const file of files) {

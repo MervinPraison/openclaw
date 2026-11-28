@@ -2,7 +2,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
-  compactCodexAppServerProtocolJsonSchemas,
   formatCodexAppServerProtocolJsonText,
   generateExperimentalCodexAppServerProtocolSource,
   selectedCodexAppServerJsonSchemas,
@@ -21,30 +20,20 @@ await main().catch((error: unknown) => {
 async function main(): Promise<void> {
   const source = await generateExperimentalCodexAppServerProtocolSource();
   try {
-    const selectedSchemas = new Map<string, unknown>();
-    for (const schema of selectedCodexAppServerJsonSchemas) {
-      const schemaSource = await fs.readFile(path.join(source.jsonRoot, schema), "utf8");
-      selectedSchemas.set(schema, JSON.parse(schemaSource));
-    }
-    const compactedSchemas = compactCodexAppServerProtocolJsonSchemas(selectedSchemas);
-
     await fs.rm(targetRoot, { recursive: true, force: true });
     await fs.mkdir(targetRoot, { recursive: true });
 
-    for (const [schema, value] of compactedSchemas) {
+    for (const schema of selectedCodexAppServerJsonSchemas) {
       await fs.mkdir(path.dirname(path.join(targetRoot, "json", schema)), { recursive: true });
+      const schemaSource = await fs.readFile(path.join(source.jsonRoot, schema), "utf8");
       await fs.writeFile(
         path.join(targetRoot, "json", schema),
-        formatCodexAppServerProtocolJsonText(JSON.stringify(value)),
+        formatCodexAppServerProtocolJsonText(schemaSource),
       );
     }
   } finally {
     await source.cleanup();
   }
-
-  // Import after writing the mirror so generation reads the refreshed JSON modules.
-  const { generateCodexValidators } = await import("./generate-codex-validators.mts");
-  await generateCodexValidators();
 
   console.log(`Synced Codex app-server generated protocol from ${source.codexRepo}`);
 }

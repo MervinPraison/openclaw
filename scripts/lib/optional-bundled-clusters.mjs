@@ -7,7 +7,6 @@ const optionalBundledClusters = [
   "memory-lancedb",
   "msteams",
   "nostr",
-  "raft",
   "tlon",
   "twitch",
   "ui",
@@ -15,13 +14,10 @@ const optionalBundledClusters = [
   "zalouser",
 ];
 
-/**
- * Bundled plugin clusters that may be excluded from size-sensitive build lanes.
- * @internal Shared repository-script contract.
- */
+/** Bundled plugin clusters that may be excluded from size-sensitive build lanes. */
 export const optionalBundledClusterSet = new Set(optionalBundledClusters);
 
-export const OPTIONAL_BUNDLED_BUILD_ENV = "OPENCLAW_INCLUDE_OPTIONAL_BUNDLED";
+const OPTIONAL_BUNDLED_BUILD_ENV = "OPENCLAW_INCLUDE_OPTIONAL_BUNDLED";
 
 function isOptionalBundledCluster(cluster) {
   return optionalBundledClusterSet.has(cluster);
